@@ -20,6 +20,7 @@ from mjlab.managers import CommandTermCfg
 from mjlab.managers.event_manager import requires_model_fields
 from mjlab.utils.lab_api.math import matrix_from_quat, wrap_to_pi, quat_apply, quat_from_angle_axis
 from rsl_rl.algorithms.ppo import PPO as _PPO
+from rsl_rl.modules.distribution import GaussianDistribution as _GaussianDistribution
 
 # ---------------------------------------------------------------------------
 # Patch 1: RewardManager.compute — sanitize NaN rewards before they enter the
@@ -6054,6 +6055,311 @@ def ball_vel_in_base(
     rot = matrix_from_quat(robot.data.root_link_quat_w)
     vel = ball.data.root_link_lin_vel_w
     return torch.bmm(rot.transpose(1, 2), vel.unsqueeze(-1)).squeeze(-1)
+
+
+# =============================================================================
+# Football — ball-tracker navigation and bounded, contact-qualified kick rewards
+# =============================================================================
+
+
+def football_navigation_command(
+    ball_xy_b: torch.Tensor,
+    direction_b: torch.Tensor,
+    struck: torch.Tensor,
+    kick_offset: tuple[float, float] = (0.10, -0.042),
+) -> torch.Tensor:
+    """Tracker adapter: ball XY and desired shot unit vector in the yaw frame.
+
+    Returns real desired [vx, vy, wz], not ball coordinates disguised as twist.
+    A small forward step near the ball distinguishes striking from post-kick
+    exact-zero idle without introducing a phase slot into the actor contract.
+    A hardware tracker must implement this same adapter and latch the strike.
+    """
+    lateral = torch.stack((-direction_b[:, 1], direction_b[:, 0]), dim=1)
+    error = ball_xy_b - kick_offset[0] * direction_b - kick_offset[1] * lateral
+    distance = torch.linalg.vector_norm(error, dim=1)
+    heading = torch.atan2(direction_b[:, 1], direction_b[:, 0])
+    velocity = 2.0 * error
+    velocity += (0.08 * torch.exp(-(distance / 0.06).square()))[:, None] * direction_b
+    # Turn before translating when the desired shot is behind the robot.
+    velocity *= torch.cos(heading).clamp_min(0.0)[:, None]
+    command = torch.stack((velocity[:, 0].clamp(-0.25, 0.35),
+                           velocity[:, 1].clamp(-0.20, 0.20),
+                           (2.0 * heading).clamp(-1.0, 1.0)), dim=1)
+    command[struck] = 0.0
+    return torch.nan_to_num(command, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+class FootballGaussianDistribution(_GaussianDistribution):
+    """Keep exploration near the verified walking policy's 0.16–0.24 rad std.
+
+    Only stochastic sampling changes; deterministic action/export stay unfiltered.
+    Bounds prevent entropy optimization from producing 10+ rad action noise.
+    """
+    def update(self, mlp_output):
+        raw = self.std_param if self.std_type == "scalar" else self.log_std_param.exp()
+        std = raw.clamp(0.05, 0.30).expand_as(mlp_output)
+        self._distribution = torch.distributions.Normal(mlp_output, std)
+
+
+def football_standing(env, min_height=0.095, max_tilt_deg=30.0):
+    """Physical support check: level trunk alone also admits a collapsed duck."""
+    robot = env.scene["robot"].data
+    height = robot.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2]
+    q = robot.root_link_quat_w
+    upright = 1 - 2 * (q[:, 1].square() + q[:, 2].square())
+    contact = env.scene.sensors["football_body_ground"].data
+    history = getattr(contact, "force_history", None)
+    if history is not None:
+        body_on_floor = torch.nan_to_num(history, nan=1.0).abs().flatten(1).sum(-1) > 0.05
+    else:
+        body_on_floor = contact.found.flatten(1).any(1)
+    return (height >= min_height) & (upright > math.cos(math.radians(max_tilt_deg))) & ~body_on_floor
+
+
+def football_lost_balance(env):
+    command = env.command_manager.get_term("twist")
+    command.update_progress()
+    return command.balance_failed
+
+
+class FootballCommand(CommandTerm):
+    """Ball-guided twist plus per-episode progress, shared by rewards/metrics.
+
+    State advances once per environment step, even when several reward terms
+    read it. Reset uses qpos-derived positions and clears ONLY selected worlds.
+    """
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self._command = torch.zeros(self.num_envs, 3, device=self.device)
+        self.ball_start = torch.zeros(self.num_envs, 2, device=self.device)
+        self.stance = torch.zeros_like(self.ball_start)
+        self.struck = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.success = torch.zeros_like(self.struck)
+        self.approached = torch.zeros_like(self.struck)
+        self.standing = torch.zeros_like(self.struck)
+        self.balance_failed = torch.zeros_like(self.struck)
+        self.bad_posture_time = torch.zeros(self.num_envs, device=self.device)
+        self.scored = torch.zeros_like(self.struck)
+        self.crossed_goal_line = torch.zeros_like(self.struck)
+        self.goal_center = torch.zeros(self.num_envs, 3, device=self.device)
+        self.previous_ball = torch.zeros_like(self.goal_center)
+        self.best_distance = torch.zeros(self.num_envs, device=self.device)
+        self.best_speed = torch.zeros_like(self.best_distance)
+        self.peak_ball_speed = torch.zeros_like(self.best_distance)
+        self.best_approach = torch.zeros_like(self.best_distance)
+        self.initial_distance = torch.zeros_like(self.best_distance)
+        self.distance_to_stance = torch.zeros_like(self.best_distance)
+        self.progress = {name: torch.zeros_like(self.best_distance) for name in ("approach", "speed", "distance", "goal")}
+        self._last_step = -1
+
+    @property
+    def command(self):
+        return self._command
+
+    def _resample_command(self, env_ids):
+        pass  # The tracker updates continuously; reset_football owns episode state.
+
+    def _update_metrics(self):
+        pass  # MetricsManager records final episode values (not averages of flags).
+
+    def _update_command(self):
+        robot = self._env.scene["robot"].data
+        ball = self._env.scene["ball"].data
+        q = robot.root_link_quat_w
+        yaw = torch.atan2(2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]),
+                          1 - 2 * (q[:, 2].square() + q[:, 3].square()))
+        c, s = yaw.cos(), yaw.sin()
+        def to_body(xy):
+            return torch.stack((c * xy[:, 0] + s * xy[:, 1],
+                                -s * xy[:, 0] + c * xy[:, 1]), dim=1)
+        self._command[:] = football_navigation_command(
+            to_body(ball.root_link_pos_w[:, :2] - robot.root_link_pos_w[:, :2]),
+            to_body(torch.nn.functional.normalize(self.goal_center[:, :2] - ball.root_link_pos_w[:, :2], dim=1)),
+            self.struck, self.cfg.kick_offset,
+        )
+
+    def reset_episode(self, env_ids, ball_xy, robot_xy, direction):
+        self.ball_start[env_ids] = ball_xy
+        self.goal_center[env_ids, :2] = ball_xy + self.cfg.target_distance * direction
+        self.goal_center[env_ids, 2] = 0.0
+        self.previous_ball[env_ids, :2] = ball_xy
+        self.previous_ball[env_ids, 2] = self.cfg.ball_radius
+        self.scored[env_ids] = False
+        self.crossed_goal_line[env_ids] = False
+        lateral = torch.stack((-direction[:, 1], direction[:, 0]), dim=1)
+        stance = ball_xy - self.cfg.kick_offset[0] * direction - self.cfg.kick_offset[1] * lateral
+        self.stance[env_ids] = stance
+        distance = torch.linalg.vector_norm(stance - robot_xy, dim=1)
+        self.initial_distance[env_ids] = distance
+        self.distance_to_stance[env_ids] = distance
+        self.best_approach[env_ids] = 0.0
+        self.best_distance[env_ids] = 0.0
+        self.best_speed[env_ids] = 0.0
+        self.peak_ball_speed[env_ids] = 0.0
+        self.struck[env_ids] = False
+        self.success[env_ids] = False
+        self.approached[env_ids] = False
+        self.standing[env_ids] = True
+        self.balance_failed[env_ids] = False
+        self.bad_posture_time[env_ids] = 0.0
+        for value in self.progress.values():
+            value[env_ids] = 0.0
+        self._command[env_ids] = 0.0
+
+    def update_progress(self):
+        env = self._env
+        if self._last_step == env.common_step_counter:
+            return
+        self._last_step = env.common_step_counter
+        robot, ball = env.scene["robot"].data, env.scene["ball"].data
+        # Use the physical gravity view only as a safety gate, not IMU tracking.
+        q = robot.root_link_quat_w
+        upright = football_standing(env, self.cfg.min_standing_height)
+        self.standing[:] = upright
+        self.bad_posture_time[:] = torch.where(upright, 0.0, self.bad_posture_time + env.step_dt)
+        self.balance_failed |= self.bad_posture_time >= self.cfg.balance_grace_s
+        upright &= ~self.balance_failed
+        direction = _ball_kick_dir(env)
+        heading = matrix_from_quat(q)[:, :2, 0]
+        aligned = (heading * direction).sum(-1) > math.cos(math.radians(30))
+        kick_data = env.scene.sensors["kick_ball_contact"].data
+        support_data = env.scene.sensors["kick_support_contact"].data
+        kick_history = getattr(kick_data, "force_history", None)
+        support_history = getattr(support_data, "force_history", None)
+        if kick_history is not None and support_history is not None:
+            # A fast strike may last less than one control step. Require support
+            # in the SAME physics substep, rather than missing a brief contact.
+            contact = torch.nan_to_num(kick_history, nan=0.0, posinf=0.0, neginf=0.0).abs().sum(-1).sum(1) > 1e-6
+            support = torch.nan_to_num(support_history, nan=0.0, posinf=0.0, neginf=0.0).abs().sum(-1).sum(1) > 1e-6
+            supported_strike = (contact & support).any(-1)
+        else:
+            supported_strike = kick_data.found.flatten(1).any(1) & support_data.found.flatten(1).any(1)
+        was_struck = self.struck.clone()
+        finite_ball = torch.isfinite(ball.root_link_pos_w).all(-1) & torch.isfinite(ball.root_link_lin_vel_w).all(-1)
+        actual_speed = torch.linalg.vector_norm(ball.root_link_lin_vel_w, dim=-1)
+        self.peak_ball_speed[:] = torch.maximum(self.peak_ball_speed, torch.where(finite_ball, actual_speed, 0.0))
+        self.struck |= supported_strike & upright & aligned & finite_ball
+        self.distance_to_stance = torch.nan_to_num(
+            torch.linalg.vector_norm(self.stance - robot.root_link_pos_w[:, :2], dim=1), nan=10.0,
+        )
+        self.approached |= (self.distance_to_stance < 0.07) & upright
+        approach = (self.initial_distance - self.distance_to_stance).clamp_min(0.0)
+        approach = torch.where(upright & ~was_struck, approach, self.best_approach)
+        displacement = torch.nan_to_num(ball.root_link_pos_w[:, :2] - self.ball_start, nan=0.0)
+        forward = (displacement * direction).sum(-1)
+        lateral = (displacement[:, 0] * direction[:, 1] - displacement[:, 1] * direction[:, 0]).abs()
+        speed = torch.nan_to_num((ball.root_link_lin_vel_w[:, :2] * direction).sum(-1), nan=0.0)
+        valid = self.struck & upright & finite_ball & (lateral < self.cfg.lateral_tolerance)
+        distance = torch.where(valid, forward.clamp(0.0, self.cfg.target_distance), self.best_distance)
+        speed = torch.where(valid, speed.clamp(0.0, self.cfg.target_speed), self.best_speed)
+        for name, value, previous in (("approach", approach, self.best_approach),
+                                      ("speed", speed, self.best_speed),
+                                      ("distance", distance, self.best_distance)):
+            # High-water increments cannot be farmed by oscillating or waiting.
+            new_best = torch.maximum(previous, value)
+            self.progress[name][:] = (new_best - previous) / env.step_dt
+            previous[:] = new_best
+        # Sweep the whole ball across the plane. Interpolation catches fast
+        # shots without granting a goal for entering the net from the side.
+        previous = self.previous_ball - self.goal_center
+        current = ball.root_link_pos_w - self.goal_center
+        before = (previous[:, :2] * direction).sum(-1)
+        after = (current[:, :2] * direction).sum(-1)
+        radius = self.cfg.ball_radius
+        crossed = (before < radius) & (after >= radius) & finite_ball
+        alpha = ((radius - before) / (after - before).clamp_min(1e-8)).clamp(0, 1)
+        crossing = previous + alpha[:, None] * (current - previous)
+        cross_y = (crossing[:, 0] * direction[:, 1] - crossing[:, 1] * direction[:, 0]).abs()
+        inside = (cross_y + radius < self.cfg.goal_width / 2) & (crossing[:, 2] + radius < self.cfg.goal_height)
+        inside &= crossing[:, 2] >= radius - 0.005  # Allow normal floor contact penetration.
+        new_goal = crossed & ~self.crossed_goal_line & inside & self.struck & upright
+        self.progress["goal"][:] = new_goal.float() / env.step_dt
+        self.scored |= new_goal
+        self.crossed_goal_line |= crossed
+        self.previous_ball[:] = ball.root_link_pos_w
+        self.success[:] = self.scored & upright & finite_ball
+
+
+
+@dataclass(kw_only=True)
+class FootballCommandCfg(CommandTermCfg):
+    kick_offset: tuple[float, float] = (0.10, -0.042)
+    target_speed: float = 1.0
+    target_distance: float = 0.75
+    lateral_tolerance: float = 0.20
+    goal_width: float = 0.40
+    goal_height: float = 0.30
+    ball_radius: float = 0.035
+    min_standing_height: float = 0.095
+    balance_grace_s: float = 0.12
+
+    def build(self, env):
+        return FootballCommand(self, env)
+
+
+def reset_football(env, env_ids, near_probability=0.5, max_distance=0.35, ball_radius=0.035,
+                   goal_angle_range=(-0.35, 0.35)):
+    """Stationary ball: mixture of reachable kick starts and approach starts.
+
+    Goal direction is sampled around reset heading. The near bucket samples 9–11 cm forward;
+    approach starts sample 20 cm to max_distance, with lateral variation.
+    No randomized ball velocity or robot-ball spawn penetration is intended.
+    """
+    if env_ids is None or len(env_ids) == 0:
+        return
+    robot, ball = env.scene["robot"], env.scene["ball"]
+    root = env.sim.data.qpos[env_ids][:, robot.indexing.free_joint_q_adr]
+    q = root[:, 3:7]
+    yaw = torch.atan2(2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]),
+                      1 - 2 * (q[:, 2].square() + q[:, 3].square()))
+    direction = torch.stack((yaw.cos(), yaw.sin()), dim=1)
+    lateral = torch.stack((-yaw.sin(), yaw.cos()), dim=1)
+    n = len(env_ids)
+    near = torch.rand(n, device=env.device) < near_probability
+    x = torch.where(near, torch.empty(n, device=env.device).uniform_(0.09, 0.11),
+                    torch.empty(n, device=env.device).uniform_(0.20, max_distance))
+    y = torch.where(near, torch.empty(n, device=env.device).uniform_(-0.052, -0.032),
+                    torch.empty(n, device=env.device).uniform_(-0.20, 0.20))
+    pose = torch.zeros(n, 7, device=env.device)
+    pose[:, :2] = root[:, :2] + x[:, None] * direction + y[:, None] * lateral
+    pose[:, 2] = env.scene.terrain.env_origins[env_ids, 2] + ball_radius
+    pose[:, 3] = 1.0
+    ball.write_root_link_pose_to_sim(pose, env_ids)
+    ball.write_root_link_velocity_to_sim(torch.zeros(n, 6, device=env.device), env_ids)
+    goal_yaw = yaw + torch.empty(n, device=env.device).uniform_(*goal_angle_range)
+    direction = torch.stack((goal_yaw.cos(), goal_yaw.sin()), dim=1)
+    _ball_kick_dir(env)[env_ids] = direction
+    command = env.command_manager.get_term("twist")
+    command.reset_episode(env_ids, pose[:, :2], root[:, :2], direction)
+    floor_z = env.scene.terrain.env_origins[env_ids, 2]
+    command.goal_center[env_ids, 2] = floor_z
+    command.previous_ball[env_ids] = pose[:, :3]
+    goal_pose = torch.zeros(n, 7, device=env.device)
+    goal_pose[:, :3] = command.goal_center[env_ids]
+    goal_pose[:, 3] = (goal_yaw / 2).cos()
+    goal_pose[:, 6] = (goal_yaw / 2).sin()
+    env.scene["goal"].write_mocap_pose_to_sim(goal_pose, env_ids)
+
+
+def football_progress(env, component: str):
+    command = env.command_manager.get_term("twist")
+    command.update_progress()
+    return command.progress[component]
+
+
+def football_metric(env, name: str):
+    command = env.command_manager.get_term("twist")
+    command.update_progress()
+    return getattr(command, name).float()
+
+
+def football_critic_state(env):
+    command = env.command_manager.get_term("twist")
+    return torch.stack((command.struck.float(), command.best_approach,
+                        command.best_speed, command.best_distance), dim=1)
+
 
 
 # --------------------------------------------------------------------------- #

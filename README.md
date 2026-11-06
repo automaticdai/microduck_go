@@ -1,61 +1,136 @@
-# Microduck RL
+# Microduck Go
 
-<img width="2215" height="884" alt="image" src="https://github.com/user-attachments/assets/5db7cc83-b3ce-4f7c-83f0-0572a63baed7" />
+**An arena for trained Microducks to face off.**
 
+[Microduck Go](https://github.com/automaticdai/microduck_go) brings learned robot
+skills into a shared arena: train a duck, enter it in a match, and watch it
+compete against another duck. Football is the first matchup — **two ducks, two
+goals, one ball** — with robot fights and other competitive challenges as the
+broader direction.
 
-RL training environments for [Microduck](https://github.com/pollen-robotics/microduck) —
-a ~800 g, ~25 cm tall bipedal robot — built on
-[mjlab](https://github.com/mujocolab/mjlab) (MuJoCo Warp) with PPO.
-Policies are trained here at 50 Hz, exported to ONNX, and deployed on the real
-robot by the runtime in [pollen-robotics/microduck](https://github.com/pollen-robotics/microduck).
+The contenders are [Microducks](https://github.com/pollen-robotics/microduck),
+~800 g, ~25 cm tall bipedal robots with 14 servos. The project builds on the
+Microduck RL training stack: [mjlab](https://github.com/mujocolab/mjlab)
+(MuJoCo Warp), PPO, and [BAM](https://github.com/Rhoban/bam) actuator physics.
+Training, evaluation, and ONNX export support the arena and provide a path to
+running learned skills on real robots.
 
-<!-- HERO VIDEO — real robot montage: walking, standup, roulade, roller skating.
-     Keep it short (~30 s) and real-robot-first: this is the "why should I care" shot. -->
+## Current state
 
-https://github.com/user-attachments/assets/50c3d537-8db2-4005-9d9c-3472faeec4d0
+| Capability | Status |
+|---|---|
+| Single-duck football | Implemented: approach a tracked ball, shoot into a goal, and stay standing. A trained checkpoint has been visually reviewed locally. |
+| Two-duck football arena | In development: a shared pitch, opposing goals, one physical ball, and independent policy control. Match behavior is still being validated. |
+| Competitive tactics and self-play | Planned: the current football policy learns individual shots, not defense, tackling, or opponent-aware strategy. |
+| Robot fights and additional game modes | Project direction; not implemented yet. |
 
-The repo encodes the full sim2real recipe: [BAM](https://github.com/Rhoban/bam)
-actuator physics, domain randomization, backlash simulation, and the
-reward-design lessons that made it work
-(see [AGENTS.md](AGENTS.md) for the distilled playbook).
+Trained weights are not bundled with the repository. The instructions below
+use checkpoint paths you provide. See the [football guide](docs/football.md)
+for the existing training task and its observation and scoring contracts.
 
-## Quickstart
+## Get started
 
-Requires a CUDA GPU (training runs through MuJoCo Warp) and [uv](https://docs.astral.sh/uv/).
-
-> **On ARM boxes (DGX Spark / GB10, Jetson):** `uv sync` pulls ~2 GB of CUDA
-> wheels on first run and uv's default 30 s HTTP timeout can abort mid-download.
-> Export `UV_HTTP_TIMEOUT=600` for the first sync. 
-
-```bash
-git clone https://github.com/pollen-robotics/microduck_rl
-cd microduck_rl
-
-# train the walking policy (uses your GPU; ~1-2 h for a usable gait at 4096 envs)
-uv run train Mjlab-Velocity-Flat-MicroDuck --env.scene.num-envs 4096
-
-# watch a trained policy in the viewer
-uv run play Mjlab-Velocity-Flat-MicroDuck --wandb-run-path <entity/project/run_id>
-
-# export to ONNX for deployment
-uv run scripts/export.py Mjlab-Velocity-Flat-MicroDuck --wandb-run-path <...>
-uv run publish --onnx output.onnx --repo <user>/microduck-<name> --kind episodic --duration-s 4.0   # share it (see "Publishing a policy")
-
-# drive the exported policy in CPU MuJoCo with the keyboard
-uv run scripts/infer_policy.py --walking output.onnx
-```
-
-Resume from a checkpoint:
+Install [uv](https://docs.astral.sh/uv/) and use Python 3.12. Training and the
+mjlab policy viewer require a CUDA GPU; exported policies can run in CPU MuJoCo.
 
 ```bash
-uv run train Mjlab-Velocity-Flat-MicroDuck --env.scene.num-envs 4096 \
-    --agent.run-name resume --agent.load-checkpoint model_29999.pt --agent.resume True
+git clone https://github.com/automaticdai/microduck_go.git
+cd microduck_go
+uv sync --locked
+
+# Discover the available training environments.
+uv run list-envs
+
+# Watch an existing football contender in the browser viewer.
+uv run play Mjlab-Football-Flat-MicroDuck \
+  --checkpoint-file path/to/football/model_4999.pt --num-envs 1 --viewer viser
 ```
 
-No GPU? Add `--hf-jobs` to any train command to run it on Hugging Face Jobs
-instead of locally (see [scripts/hf/README.md](scripts/hf/README.md)).
+Open the local URL printed by the viewer, normally `http://localhost:8080`.
+This command runs the established single-duck approach-and-shoot task. The
+competitive arena is the next step and is not yet a validated quickstart.
 
-## Tasks
+On ARM machines (DGX Spark / GB10, Jetson), set `UV_HTTP_TIMEOUT=600` before
+the first sync to allow time for the CUDA wheels to download.
+
+## From skill to competition
+
+1. **Train a contender.** Start with walking and balance, then train an arena
+   skill such as approaching a ball and shooting.
+2. **Evaluate the policy.** Check standing, task success, and visual behavior;
+   a higher training reward alone does not establish match readiness.
+3. **Enter the arena.** The arena under development puts independently controlled
+   ducks in the same physics simulation, with shared objects and match rules.
+4. **Improve through competition.** Opponent-aware training and self-play are
+   future work built on those match outcomes.
+
+The Python package remains `mjlab_microduck`, and existing `Mjlab-…-MicroDuck`
+task IDs and command names remain valid after the project rename.
+
+For remote training, add `--hf-jobs` to the standard `train` command; see the
+[Hugging Face Jobs guide](scripts/hf/README.md). Football's training helper can
+also run directly on a remote CUDA server.
+
+## Train a football contender
+
+`Mjlab-Football-Flat-MicroDuck` trains the duck to approach a tracked ball,
+line up a right-foot shot into a physical goal, and remain standing afterward.
+The goal is 40 cm wide and 30 cm high, positioned 75 cm beyond the ball.
+A score requires the whole ball to cross between the posts and below the bar.
+The matching backlash task is `Mjlab-Football-Flat-Backlash-MicroDuck`.
+
+Start from a compatible 61D walking checkpoint. The helper transfers the actor
+and its observation normalizer, with a fresh critic, optimizer, and curriculum.
+Checkpoints are not bundled with this repository. Run the smoke test before
+starting a long run, on either a local CUDA GPU or a remote GPU server:
+
+```bash
+uv sync --locked
+
+# Validate this walking initialization: 64 environments, five iterations.
+uv run scripts/train_football.py --from-walking path/to/walking/model_3000.pt \
+  --num-envs 64 --iterations 5 --eval-every 5 --run-name football-smoke
+
+# Train for 5,000 iterations, checking standing and approach every 100.
+uv run scripts/train_football.py --from-walking path/to/walking/model_3000.pt \
+  --num-envs 4096 --iterations 5000 --eval-every 100 --run-name football
+```
+
+Runs and checkpoints are saved under `logs/rsl_rl/football/<timestamp>_<run-name>/`.
+Evaluation checks stop training on a substantial standing or approach regression.
+To keep training while recording those failures, add `--continue-on-regression`.
+This changes the evaluation stop policy; physical balance checks remain active.
+
+```bash
+# Resume full training state. --iterations counts ADDITIONAL iterations:
+# checkpoint 999 + 4,000 more finishes at checkpoint 4999 (5,000 total).
+uv run scripts/train_football.py --resume path/to/football/model_999.pt \
+  --num-envs 4096 --iterations 4000 --eval-every 100 --run-name football-resume
+
+# Watch repeated approach-and-shoot episodes in an interactive browser viewer.
+# Open the localhost URL printed by the viewer (normally port 8080).
+uv run play Mjlab-Football-Flat-MicroDuck \
+  --checkpoint-file path/to/football/model_4999.pt --num-envs 1 --viewer viser
+
+# Evaluate 192 approach episodes; add --idle for standing or
+# --near-probability 1 for shots starting beside the ball.
+uv run scripts/eval_football.py --checkpoint-file path/to/football/model_4999.pt \
+  --output logs/football_eval.json --video logs/football_eval.mp4
+
+# Export through the normalizer-aware export path.
+uv run scripts/export.py Mjlab-Football-Flat-MicroDuck \
+  --checkpoint-file path/to/football/model_4999.pt --num-envs 1 \
+  --onnx-file football.onnx
+```
+
+The actor retains the shared 61D observation contract. Simulation supplies a
+ball-and-goal tracker that converts object positions into navigation commands;
+hardware needs an equivalent tracker and strike detector. The ONNX alone does
+not provide vision or navigation, and this task cannot use the constant-command
+`publish` workflow. See [the football guide](docs/football.md) for scoring,
+standing checks, physics validation, and evaluation details.
+
+## Foundation skills
 
 `uv run list-envs` prints the live registry. Flat/Rough variants exist where noted.
 
@@ -65,12 +140,13 @@ instead of locally (see [scripts/hf/README.md](scripts/hf/README.md)).
 
 | Task id | Terrain | Description |
 |---|---|---|
-| `Mjlab-Velocity-{Flat,Rough}-MicroDuck` | flat/rough | **The main task**: walking with velocity commands + head-pose commands |
+| `Mjlab-Velocity-{Flat,Rough}-MicroDuck` | flat/rough | Walking with velocity commands + head-pose commands |
 | `Mjlab-VelStand-{Flat,Rough}-MicroDuck` | flat/rough | Walking + fall recovery in one policy |
 | `Mjlab-StandUp-{Flat,Rough}-MicroDuck` | flat/rough | Stand up from face-down/face-up/sitting, then hold the stand + body-pose control |
 | `Mjlab-SitStand-{Flat,Rough}-MicroDuck` | flat/rough | Commanded sit ↔ stand in one policy, gently, head commandable |
 | `Mjlab-GroundPick-{Flat,Rough}-MicroDuck` | flat/rough | Crouch and touch the ground with the mouth tip, return to stand |
 | `Mjlab-BallKick-Flat-MicroDuck` | flat | Kick a 70 mm / 15 g ball forward (actor is ball-blind) |
+| `Mjlab-Football-Flat-MicroDuck` | flat | Approach a tracked 70 mm ball and shoot into a physical goal; [training and tracker contract](docs/football.md) |
 | `Mjlab-Roulade-Flat-MicroDuck` | flat | Forward roll over the head, land back on the feet |
 | `Mjlab-Velocity-Flat-MicroDuck-Rollers` | flat | Roller-skate velocity tracking (passive wheels under the feet) |
 | `Mjlab-Velocity-Swizzle-MicroDuck` | flat | Classic symmetric swizzle skating |
@@ -130,9 +206,9 @@ one `config_mjcf_*.json` per model:
 | XML | Used by |
 |---|---|
 | `robot_walk.xml` | Velocity (stripped trunk/head contacts — falling is cheap) |
-| `robot_groundcontact.xml` | VelStand, StandUp, SitStand, GroundPick, BallKick, Roulade (curated collision set for the parts that touch the floor — body can physically lie on the ground; formerly `robot_allcollisions.xml`) |
+| `robot_groundcontact.xml` | VelStand, StandUp, SitStand, GroundPick, BallKick, Football, Roulade (curated collision set for the parts that touch the floor — body can physically lie on the ground; formerly `robot_allcollisions.xml`) |
 | `robot_groundcontact_rollers.xml` | Roller tasks (passive wheels) |
-| `robot_allcollisions.xml` | True full-collision model — every part has a collision geom. No task uses it yet |
+| `robot_allcollisions.xml` | True full-collision model — every part has a collision geom. Tasks needing full-body collision coverage |
 | `robot_*_backlash.xml` | Backlash task variants (generated by `add_backlash.py`) |
 
 `scene*.xml` files wrap the robots with a floor + keyframes (STAND/SIT/FOLD)
@@ -181,7 +257,7 @@ Conventions worth knowing:
 rules learned across the project (also aimed at AI coding agents working in
 this repo).
 
-## Publishing a policy
+## Deploying skills to a real duck
 
 `uv run publish` puts a policy on the Hugging Face Hub in the shape the robot's
 daemon loads: one `policy.onnx` with the observation normalizer baked in, a
@@ -250,6 +326,8 @@ CPU-only config-invariant and reward-function regression tests — they lock in
 joint-index mappings, reward sign conventions, and NaN guards.
 
 ## Related projects
+
+- [microduck_rl](https://github.com/pollen-robotics/microduck_rl) — the upstream training foundation for Microduck Go
 
 - [microduck](https://github.com/pollen-robotics/microduck) — the Microduck project home, including the onboard runtime that runs the exported policies
 - [mjlab](https://github.com/mujocolab/mjlab) — the training framework (MuJoCo Warp + rsl_rl)
