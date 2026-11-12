@@ -76,7 +76,10 @@ def navigation_env():
     scene['ball'] = SimpleNamespace(data=SimpleNamespace(root_link_pos_w=torch.tensor([[0.,0.,.035]]).repeat(2,1)))
     cfg = mdp.ArenaTeamJointPositionActionCfg(entity_name='robot',actuator_names=('^(?!passive_).*',))
     return SimpleNamespace(scene=scene,num_envs=2,device='cpu',
-                           action_manager=SimpleNamespace(get_term=lambda _:SimpleNamespace(cfg=cfg)))
+                           action_manager=SimpleNamespace(get_term=lambda _:SimpleNamespace(cfg=cfg)),
+                           command_manager=SimpleNamespace(get_term=lambda _:SimpleNamespace(
+                               cfg=mdp.ArenaTeamCommandCfg(resampling_time_range=(21.,21.),
+                                   pitch_half_length=1.5,pitch_half_width=1.))))
 
 
 def test_defenders_hold_own_goals_and_attackers_mirror():

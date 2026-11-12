@@ -7703,6 +7703,13 @@ def roulade_lateral_velocity_penalty(
 from mjlab.envs.mdp.actions.actions import JointPositionAction, JointPositionActionCfg
 
 
+def arena_field(env):
+    """Goal-line half length and touchline half width; legacy arenas keep their size."""
+    manager = getattr(env, 'command_manager', None)
+    cfg = manager.get_term('twist').cfg if manager is not None else None
+    return getattr(cfg, 'pitch_half_length', .9), getattr(cfg, 'pitch_half_width', .65)
+
+
 def arena_navigation(env, entity_name, attack_sign, target=None):
     """Attack tracker command; `target` (env-local xy) replaces the goal-center aim point."""
     robot = env.scene[entity_name].data
@@ -7710,7 +7717,7 @@ def arena_navigation(env, entity_name, attack_sign, target=None):
     origins = env.scene.terrain.env_origins
     goal = origins[:, :2].clone()
     if target is None:
-        goal[:, 0] += .9 * attack_sign
+        goal[:, 0] += arena_field(env)[0] * attack_sign
     else:
         goal += target
     q = robot.root_link_quat_w
@@ -7723,7 +7730,7 @@ def arena_navigation(env, entity_name, attack_sign, target=None):
         torch.zeros(env.num_envs,dtype=torch.bool,device=env.device))
 
 
-def arena_open_aim(ball_xy, blocker_xy, previous_side, blocker_radius=.12, post_margin=.02, hysteresis=.2):
+def arena_open_aim(ball_xy, blocker_xy, previous_side, blocker_radius=.12, post_margin=.02, hysteresis=.2, goal_x=.9):
     """Aim point on the +x goal line: middle of the widest mouth gap beside the blocker's shadow.
 
     Angles are seen from the ball; the shadow is the blocker's body half-width (8.5 cm) plus
@@ -7732,7 +7739,7 @@ def arena_open_aim(ball_xy, blocker_xy, previous_side, blocker_radius=.12, post_
     (+1 left, -1 right, 0 none) needs a hysteresis-times-wider gap to switch sides.
     Returns (aim_xy, side).
     """
-    line = .935  # Ball-center crossing plane; mouth |y| <= .165 there (update_match).
+    line = goal_x + .035  # Ball-center crossing plane; mouth |y| <= .165 there (update_match).
     half = .165-post_margin
     dx = (line-ball_xy[:,0]).clamp_min(1e-3)
     lo = torch.atan2(-half-ball_xy[:,1],dx)
@@ -7756,12 +7763,13 @@ def arena_open_aim(ball_xy, blocker_xy, previous_side, blocker_radius=.12, post_
     side = torch.where(blocking, side, torch.zeros_like(side))
     aim = torch.stack((torch.full_like(dx,line), ball_xy[:,1]+dx*torch.tan(angle)),-1)
     center_aim = torch.zeros_like(aim)
-    center_aim[:,0] = .9  # Exactly the default tracker's target when nothing blocks.
+    center_aim[:,0] = goal_x  # Exactly the default tracker's target when nothing blocks.
     return torch.where(blocking[:,None],aim,center_aim), side
 
 
 def arena_keeper_command(robot_xy, yaw, ball_xy, goal_xy, defend_sign, distance=.2,
-                         deadband=.06, turn_deadband=.25, max_speed=(.15,.25,.12,.5)):
+                         deadband=.06, turn_deadband=.25, max_speed=(.15,.25,.12,.5),
+                         half_length=.9, half_width=.65):
     """Goalkeeper [vx, vy, wz]: hold the ball-to-goal-center line, facing up the field.
 
     The spot sits `distance` from the goal center, at least 8 cm in front of the line
@@ -7791,7 +7799,7 @@ def arena_keeper_command(robot_xy, yaw, ball_xy, goal_xy, defend_sign, distance=
     back,fwd,side,yaw_rate = max_speed
     command = torch.stack((velocity[:,0].clamp(-back,fwd),velocity[:,1].clamp(-side,side),
                            turn.clamp(-yaw_rate,yaw_rate)),dim=1)
-    in_play = (ball_xy[:,0].abs() <= .9) & (ball_xy[:,1].abs() <= .65)
+    in_play = (ball_xy[:,0].abs() <= half_length) & (ball_xy[:,1].abs() <= half_width)
     command = command*in_play[:,None]
     return torch.nan_to_num(command,nan=0.,posinf=0.,neginf=0.)
 
@@ -7803,11 +7811,11 @@ def arena_keeper_navigation(env, entity_name, defend_sign, distance=.2, clear_ra
     origin = env.scene.terrain.env_origins[:,:2]
     ball = env.scene['ball'].data.root_link_pos_w[:,:2]-origin
     goal = torch.zeros_like(ball)
-    goal[:,0] = .9*defend_sign
+    goal[:,0] = arena_field(env)[0]*defend_sign
     q = data.root_link_quat_w
     yaw = torch.atan2(2*(q[:,0]*q[:,3]+q[:,1]*q[:,2]), 1-2*(q[:,2]**2+q[:,3]**2))
     command = arena_keeper_command(data.root_link_pos_w[:,:2]-origin,yaw,ball,goal,defend_sign,distance,
-                                   max_speed=max_speed)
+                                   max_speed=max_speed,half_length=arena_field(env)[0],half_width=arena_field(env)[1])
     if clear_radius > 0:
         clear = torch.linalg.vector_norm(ball-goal,dim=-1) < clear_radius
         command = torch.where(clear[:,None],arena_navigation(env,entity_name,-defend_sign),command)
@@ -7871,12 +7879,15 @@ class ArenaJointPositionAction(JointPositionAction):
             self.opponent.raw_action,self.opponent_command(),
             torch.zeros(env.num_envs,10,device=env.device)),dim=-1)
         self.opponent_velocity[:] = data.joint_vel[:,ids]
+        self.opponent.process_actions(self._infer_opponent(obs))
+
+    def _infer_opponent(self, obs):
+        env = self._env
         policy = getattr(env,'arena_opponent_policy',None)
         if policy is None:
             raise RuntimeError('Arena requires an opponent policy; use scripts/train_arena.py')
         with torch.no_grad():
-            opponent_actions = policy({'actor':torch.nan_to_num(obs)})
-        self.opponent.process_actions(opponent_actions)
+            return policy({'actor':torch.nan_to_num(obs)})
 
     def apply_actions(self):
         super().apply_actions()
@@ -7897,6 +7908,41 @@ class ArenaJointPositionActionCfg(JointPositionActionCfg):
 
     def build(self,env):
         return ArenaJointPositionAction(self,env)
+
+
+class ArenaFinishingJointPositionAction(ArenaJointPositionAction):
+    """Optional recovery for the frozen opponent; never override the PPO learner."""
+    def _infer_opponent(self, obs):
+        return arena_recovery_action(self._env, 'opponent', obs, super()._infer_opponent(obs))
+
+
+@dataclass(kw_only=True)
+class ArenaFinishingJointPositionActionCfg(ArenaJointPositionActionCfg):
+    def build(self, env):
+        return ArenaFinishingJointPositionAction(self, env)
+
+
+class ArenaReturnToPlayAction(ArenaFinishingJointPositionAction):
+    def reset(self, env_ids=None):
+        super().reset(env_ids)
+        env=self._env
+        starts=getattr(env,'arena_return_start_indices',None)
+        if starts is None:
+            return
+        ids=torch.arange(env.num_envs,device=env.device) if env_ids is None else env_ids
+        if isinstance(ids,slice):
+            ids=torch.arange(env.num_envs,device=env.device)[ids]
+        ids=ids[starts[ids]>=0]
+        previous=env.arena_return_starts['last_action'][starts[ids]]
+        self._raw_actions[ids]=previous
+        env.action_manager.action[ids]=previous
+        env.action_manager.prev_action[ids]=previous
+
+
+@dataclass(kw_only=True)
+class ArenaReturnToPlayActionCfg(ArenaFinishingJointPositionActionCfg):
+    def build(self,env):
+        return ArenaReturnToPlayAction(self,env)
 
 
 class ArenaCommand(CommandTerm):
@@ -7970,8 +8016,9 @@ class ArenaCommand(CommandTerm):
         self.goal_delta.zero_()
         for direction,flag in ((1,self.scored),(-1,self.conceded)):
             before,after = direction*previous[:,0],direction*ball[:,0]
-            crossed = (before < .935) & (after >= .935)
-            alpha = ((.935-before)/(after-before).clamp_min(1e-8)).clamp(0,1)
+            line = self.cfg.pitch_half_length + .035
+            crossed = (before < line) & (after >= line)
+            alpha = ((line-before)/(after-before).clamp_min(1e-8)).clamp(0,1)
             crossing = previous+alpha[:,None]*(ball-previous)
             inside = (crossing[:,1].abs() <= .165) & (crossing[:,2] >= .030) & (crossing[:,2] <= .265)
             new_goal = crossed & inside & ~self.scored & ~self.conceded
@@ -7991,7 +8038,7 @@ class ArenaCommand(CommandTerm):
         distance = torch.linalg.vector_norm(robot_xy-stance,dim=-1)
         approach = (self.initial_distance-distance).clamp_min(0)
         target = torch.zeros_like(ball[:,:2])
-        target[:,0] = .9
+        target[:,0] = arena_field(env)[0]
         to_goal = target-ball[:,:2]
         goal_distance = torch.linalg.vector_norm(to_goal,dim=-1)
         direction = torch.nn.functional.normalize(to_goal,dim=-1)
@@ -8022,6 +8069,8 @@ class ArenaCommand(CommandTerm):
 
 @dataclass(kw_only=True)
 class ArenaCommandCfg(CommandTermCfg):
+    pitch_half_length: float = .9
+    pitch_half_width: float = .65
     track_training_signals: bool = True
     # 'open': tracker aims beside the opponent (arena_open_aim); the approach reward's
     # kick stance follows the same aim point.
@@ -8035,6 +8084,89 @@ class ArenaCommandCfg(CommandTermCfg):
 
     def build(self,env):
         return ArenaCommand(self,env)
+
+
+class ArenaFinishingCommand(ArenaCommand):
+    """Open-goal aim on the actual enlarged pitch, with persistent side hysteresis."""
+    def _update_command(self):
+        env = self._env
+        origin = env.scene.terrain.env_origins[:,:2]
+        self.aim_xy[:], self.aim_side[:] = arena_open_aim(
+            env.scene['ball'].data.root_link_pos_w[:,:2]-origin,
+            env.scene['opponent'].data.root_link_pos_w[:,:2]-origin,
+            self.aim_side, goal_x=arena_field(env)[0])
+        self._command[:] = arena_navigation(env, 'robot', 1, self.aim_xy)
+
+
+@dataclass(kw_only=True)
+class ArenaFinishingCommandCfg(ArenaCommandCfg):
+    def build(self, env):
+        return ArenaFinishingCommand(self, env)
+
+
+def reset_arena_finishing(env, env_ids, mode_stages):
+    """Team attacker starting sides; actual goal-line keeper; restore all baselines."""
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs,device=env.device)
+    reset_arena(env, env_ids, mode_stages)
+    n = len(env_ids)
+    origin = env.scene.terrain.env_origins[env_ids]
+    mode = arena_opponent_mode(env)[env_ids]
+    if (mode == ATTACKER).any():
+        raise ValueError('Finishing supports only empty-goal and keeper rounds')
+    robot_xy = torch.zeros(n,2,device=env.device)
+    robot_xy[:,0] = -.55
+    robot_xy[:,1] = torch.where(torch.rand(n,device=env.device)<.5, -.42, .42)
+    opponent_xy = torch.zeros_like(robot_xy)
+    distance = env.action_manager.get_term('joint_pos').cfg.keeper_distance
+    opponent_xy[:,0] = torch.where(mode == KEEPER, arena_field(env)[0]-distance, 0.)
+    opponent_xy[:,1] = torch.where(mode == KEEPER, 0., 2.2)
+    for name,xy in (('robot',robot_xy),('opponent',opponent_xy)):
+        pose = torch.zeros(n,7,device=env.device)
+        pose[:,:3] = origin
+        pose[:,:2] += xy
+        pose[:,2] += .125
+        pose[:,3 if name == 'robot' else 6] = 1
+        env.scene[name].write_root_link_pose_to_sim(pose,env_ids)
+    term = env.command_manager.get_term('twist')
+    ball = term.previous_ball[env_ids,:2]-origin[:,:2]
+    term.aim_xy[env_ids],term.aim_side[env_ids] = arena_open_aim(
+        ball,opponent_xy,torch.zeros(n,dtype=torch.long,device=env.device),goal_x=arena_field(env)[0])
+    term.initial_distance[env_ids] = (arena_kick_stance(ball,term.aim_xy[env_ids])-robot_xy).norm(dim=-1)
+    recovery = getattr(env,'arena_recovery',None)
+    if recovery is not None:
+        recovery.reset(env_ids)
+
+
+def reset_arena_return_to_play(env,env_ids,mode_stages,start_probability=.5):
+    """Practice football from measured get-up endings as well as normal spawns."""
+    if env_ids is None:
+        env_ids=torch.arange(env.num_envs,device=env.device)
+    reset_arena_finishing(env,env_ids,mode_stages)
+    bank=getattr(env,'arena_return_starts',None)
+    if bank is None:  # Initial construction before the runner loads the dataset.
+        return
+    if not hasattr(env,'arena_return_start_indices'):
+        env.arena_return_start_indices=torch.full((env.num_envs,),-1,device=env.device,dtype=torch.long)
+    env.arena_return_start_indices[env_ids]=-1
+    ids=env_ids[torch.rand(len(env_ids),device=env.device)<start_probability]
+    if len(ids)==0:
+        return
+    sample=torch.randint(len(bank['height']),(len(ids),),device=env.device)
+    env.arena_return_start_indices[ids]=sample
+    robot=env.scene['robot'];servo=_servo_joint_ids(env,robot)
+    pose=torch.cat((robot.data.root_link_pos_w[ids].clone(),bank['quat'][sample]),-1)
+    pose[:,2]=env.scene.terrain.env_origins[ids,2]+bank['height'][sample]
+    robot.write_root_link_pose_to_sim(pose,ids)
+    robot.write_root_link_velocity_to_sim(bank['velocity'][sample],ids)
+    robot.write_joint_state_to_sim(bank['joint_pos'][sample],bank['joint_vel'][sample],
+                                  joint_ids=servo,env_ids=ids)
+
+
+def arena_return_to_play_failed(env):
+    term=env.command_manager.get_term('twist')
+    term.update_match()
+    return term.down_steps>=term.cfg.fall_persist_steps
 
 
 def arena_stage_probs(env,mode_stages):
@@ -8088,7 +8220,7 @@ def reset_arena(env,env_ids,mode_stages=None):
     for name,sign in (('goal',1),('own_goal',-1)):
         pose = torch.zeros(n,7,device=env.device)
         pose[:,:3] = origin
-        pose[:,0] += sign*.9
+        pose[:,0] += sign*arena_field(env)[0]
         pose[:,3 if sign == 1 else 6] = 1
         env.scene[name].write_mocap_pose_to_sim(pose,env_ids)
     if 'boards' in env.scene.entities:  # Mocap, like the goals: one set per arena origin.
@@ -8114,11 +8246,11 @@ def reset_arena(env,env_ids,mode_stages=None):
         term.aim_xy[env_ids],term.aim_side[env_ids] = arena_open_aim(
             local_ball,opponent_local,torch.zeros(n,dtype=torch.long,device=env.device))
     else:
-        term.aim_xy[env_ids] = torch.tensor([.9,0.],device=env.device)
+        term.aim_xy[env_ids] = torch.tensor([arena_field(env)[0],0.],device=env.device)
     term.initial_distance[env_ids] = torch.linalg.vector_norm(
         arena_kick_stance(local_ball,term.aim_xy[env_ids])-(robot_xy-origin[:,:2]),dim=-1)
     target = torch.zeros_like(local_ball)
-    target[:,0] = .9
+    target[:,0] = arena_field(env)[0]
     term.initial_goal_distance[env_ids] = torch.linalg.vector_norm(target-local_ball,dim=-1)
 
 
@@ -8228,8 +8360,8 @@ ARENA_TEAM_PLAYERS = {
     'orange_defender': (-1, 'defender'),
 }
 ARENA_TEAM_SPAWNS = {
-    'robot': (-.38, -.26), 'blue_attacker': (-.38, .26), 'blue_defender': (-.7, 0.),
-    'opponent': (.38, .26), 'orange_attacker': (.38, -.26), 'orange_defender': (.7, 0.),
+    'robot': (-.55, -.42), 'blue_attacker': (-.55, .42), 'blue_defender': (-1.3, 0.),
+    'opponent': (.55, .42), 'orange_attacker': (.55, -.42), 'orange_defender': (1.3, 0.),
 }
 
 
@@ -8244,7 +8376,7 @@ def arena_team_navigation(env, name, previous_side):
     blocker = 'orange_defender' if sign == 1 else 'blue_defender'
     aim,side = arena_open_aim(
         sign*(env.scene['ball'].data.root_link_pos_w[:,:2]-origin),
-        sign*(env.scene[blocker].data.root_link_pos_w[:,:2]-origin),previous_side)
+        sign*(env.scene[blocker].data.root_link_pos_w[:,:2]-origin),previous_side,goal_x=arena_field(env)[0])
     previous_side[:] = side
     aim = sign*aim
     return arena_navigation(env,name,sign,aim), aim
@@ -8253,7 +8385,7 @@ def arena_team_navigation(env, name, previous_side):
 class ArenaTeamCommand(ArenaCommand):
     def _update_command(self):
         command,aim = arena_team_navigation(self._env,'robot',self.aim_side)
-        self._command[:] = command
+        self._command[:] = getattr(self._env, 'arena_tactical_commands', {}).get('robot', command)
         self.aim_xy[:] = aim
 
 
@@ -8261,6 +8393,61 @@ class ArenaTeamCommand(ArenaCommand):
 class ArenaTeamCommandCfg(ArenaCommandCfg):
     def build(self,env):
         return ArenaTeamCommand(self,env)
+
+
+# Automatic motor recovery is independent of the five learned tactical choices.
+# Hysteresis avoids policy chatter during normal gait; recovery never teleports.
+ARENA_RECOVERY_CONFIG = dict(fall_height=.065, fall_cos=.5, fall_seconds=.16,
+                             stand_height=.095, stand_cos=math.cos(math.pi/6),
+                             stable_seconds=.4, max_angular_speed=3.)
+
+
+class ArenaRecovery:
+    """Per-player fall latch and stable-upright handoff, with isolated arena resets."""
+    def __init__(self, env):
+        self.env = env
+        shape = (env.num_envs, len(ARENA_TEAM_PLAYERS))
+        self.active = torch.zeros(shape, dtype=torch.bool, device=env.device)
+        self.fallen_time = torch.zeros(shape, device=env.device)
+        self.stable_time = torch.zeros(shape, device=env.device)
+        self.entered = torch.zeros_like(self.active)
+        self.succeeded = torch.zeros_like(self.active)
+
+    def reset(self, env_ids=None):
+        ids = slice(None) if env_ids is None else env_ids
+        self.active[ids] = False
+        self.fallen_time[ids] = 0
+        self.stable_time[ids] = 0
+
+    def select(self, name, observation, football_action):
+        env = self.env
+        i = tuple(ARENA_TEAM_PLAYERS).index(name)
+        d = env.scene[name].data
+        cfg = ARENA_RECOVERY_CONFIG
+        height = d.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2]
+        up = -d.projected_gravity_b[:, 2]
+        fallen = (height < cfg['fall_height']) | (up < cfg['fall_cos'])
+        stable = ((height >= cfg['stand_height']) & (up >= cfg['stand_cos'])
+                  & (d.root_link_ang_vel_b.norm(dim=-1) < cfg['max_angular_speed']))
+        self.fallen_time[:, i] = torch.where(fallen, self.fallen_time[:, i]+env.step_dt, 0.)
+        self.entered[:, i] = ~self.active[:, i] & (self.fallen_time[:, i] >= cfg['fall_seconds'])
+        self.active[:, i] |= self.entered[:, i]
+        self.stable_time[:, i] = torch.where(self.active[:, i] & stable,
+                                             self.stable_time[:, i]+env.step_dt, 0.)
+        self.succeeded[:, i] = self.active[:, i] & (self.stable_time[:, i] >= cfg['stable_seconds'])
+        self.active[:, i] &= ~self.succeeded[:, i]
+        # Keep proprioception and actual previous motor action, but command nominal
+        # standing: all 13 command slots zero, using the expert's OWN normalizer.
+        recovery_obs = observation.clone()
+        recovery_obs[:, 48:] = 0.
+        with torch.no_grad():
+            recovery_action = env.arena_recovery_policy({'actor': torch.nan_to_num(recovery_obs)})
+        return torch.where(self.active[:, i, None], recovery_action, football_action)
+
+
+def arena_recovery_action(env, name, observation, football_action):
+    recovery = getattr(env, 'arena_recovery', None)
+    return football_action if recovery is None else recovery.select(name, observation, football_action)
 
 
 class ArenaTeamJointPositionAction(JointPositionAction):
@@ -8294,12 +8481,14 @@ class ArenaTeamJointPositionAction(JointPositionAction):
             data = asset.data
             ids = _servo_joint_ids(env,asset)
             command,_ = arena_team_navigation(env,name,self.aim_sides[name])
+            command = getattr(env, 'arena_tactical_commands', {}).get(name, command)
             obs = torch.cat((data.root_link_ang_vel_b,data.projected_gravity_b,
                 data.joint_pos[:,ids]-data.default_joint_pos[:,ids],self.velocities[name],
                 action.raw_action,command,torch.zeros(env.num_envs,10,device=env.device)),dim=-1)
             self.velocities[name][:] = data.joint_vel[:,ids]
             with torch.no_grad():
-                action.process_actions(policy({'actor':torch.nan_to_num(obs)}))
+                motor_action = policy({'actor':torch.nan_to_num(obs)})
+                action.process_actions(arena_recovery_action(env, name, obs, motor_action))
 
     def apply_actions(self):
         super().apply_actions()
@@ -8325,6 +8514,9 @@ class ArenaTeamJointPositionActionCfg(ArenaJointPositionActionCfg):
 def reset_arena_teams(env,env_ids):
     """Mirrored, separated formations; reset all six players and the shared match."""
     reset_arena(env,env_ids)
+    recovery = getattr(env, 'arena_recovery', None)
+    if recovery is not None:
+        recovery.reset(env_ids)
     if env_ids is None:
         env_ids = torch.arange(env.num_envs,device=env.device)
     origin = env.scene.terrain.env_origins[env_ids]
@@ -8332,7 +8524,7 @@ def reset_arena_teams(env,env_ids):
     for name,(x,y) in ARENA_TEAM_SPAWNS.items():
         sign,role = ARENA_TEAM_PLAYERS[name]
         if role == 'defender':
-            x = -sign*(.9-env.action_manager.get_term('joint_pos').cfg.keeper_distance)
+            x = -sign*(arena_field(env)[0]-env.action_manager.get_term('joint_pos').cfg.keeper_distance)
         asset = env.scene[name]
         pose = torch.zeros(n,7,device=env.device)
         pose[:,:3] = origin+torch.tensor([x,y,.125],device=env.device)
@@ -8345,9 +8537,9 @@ def reset_arena_teams(env,env_ids):
     term = env.command_manager.get_term('twist')
     ball = term.previous_ball[env_ids,:2]-origin[:,:2]
     blocker = torch.zeros_like(ball)
-    blocker[:,0] = .9-env.action_manager.get_term('joint_pos').cfg.keeper_distance
+    blocker[:,0] = arena_field(env)[0]-env.action_manager.get_term('joint_pos').cfg.keeper_distance
     term.aim_xy[env_ids],term.aim_side[env_ids] = arena_open_aim(
-        ball,blocker,torch.zeros(n,dtype=torch.long,device=env.device))
+        ball,blocker,torch.zeros(n,dtype=torch.long,device=env.device),goal_x=arena_field(env)[0])
     robot_xy = torch.tensor(ARENA_TEAM_SPAWNS['robot'],device=env.device)
     term.initial_distance[env_ids] = (arena_kick_stance(ball,term.aim_xy[env_ids])-robot_xy).norm(dim=-1)
 
@@ -8375,3 +8567,276 @@ def feet_only_support_gated(env, inner, inner_params, sensor_name="non_foot_grou
     else:
         touching = data.found.flatten(1).gt(0).any(-1)
     return inner(env, **inner_params) * (~touching).float()
+
+
+# Tactical MAPPO: separate observation/action contract above frozen 61D motor actors.
+MAPPO_BLUE = ('robot', 'blue_attacker')
+MAPPO_SKILLS = ('pursue', 'support_left', 'support_right', 'cover', 'idle')
+# Full-round budgets: <= 1 point for falls and <= .2 for crowding versus 100/goal.
+# The measured tracker baseline scores only 4/64 rounds; large attempt taxes buy idle.
+MAPPO_FALL_COST_PER_SECOND = .05
+MAPPO_CROWDING_COST_PER_SECOND = .01
+
+
+def arena_tactical_observations(env):
+    """Egocentric positions/velocities, own state, role and clock; explicit scales."""
+    length,width = arena_field(env)
+    origin = env.scene.terrain.env_origins
+    scale = torch.tensor([length,width],device=env.device)
+    ball = env.scene['ball'].data
+    clock = (1-env.episode_length_buf.float()/env.max_episode_length)[:,None]
+    global_parts = [(ball.root_link_pos_w-origin)/length,ball.root_link_lin_vel_w]
+    for name in ARENA_TEAM_PLAYERS:
+        d = env.scene[name].data
+        global_parts.extend(((d.root_link_pos_w-origin)/length,d.root_link_quat_w,
+                             d.root_link_lin_vel_w,d.root_link_ang_vel_b))
+    global_state = torch.cat((*global_parts,clock),-1)
+    actors,critics = [],[]
+    for index,name in enumerate(MAPPO_BLUE):
+        d = env.scene[name].data
+        q = d.root_link_quat_w
+        yaw = torch.atan2(2*(q[:,0]*q[:,3]+q[:,1]*q[:,2]),1-2*(q[:,2]**2+q[:,3]**2))
+        def local(v):
+            return torch.stack((yaw.cos()*v[:,0]+yaw.sin()*v[:,1],
+                                -yaw.sin()*v[:,0]+yaw.cos()*v[:,1]),-1)
+        parts = [local(ball.root_link_pos_w[:,:2]-d.root_link_pos_w[:,:2])/length,
+                 local(ball.root_link_lin_vel_w[:,:2]-d.root_link_lin_vel_w[:,:2])]
+        for other in ARENA_TEAM_PLAYERS:
+            if other != name:
+                o = env.scene[other].data
+                parts.extend((local(o.root_link_pos_w[:,:2]-d.root_link_pos_w[:,:2])/length,
+                              local(o.root_link_lin_vel_w[:,:2]-d.root_link_lin_vel_w[:,:2])))
+        for sign in (-1,1):
+            goal = origin[:,:2].clone()
+            goal[:,0] += sign*length
+            parts.append(local(goal-d.root_link_pos_w[:,:2])/length)
+        role = torch.zeros(env.num_envs,2,device=env.device)
+        role[:,index] = 1
+        parts.extend(((d.root_link_pos_w[:,:2]-origin[:,:2])/scale,
+                      d.root_link_lin_vel_b,d.projected_gravity_b,
+                      yaw.sin()[:,None],yaw.cos()[:,None],role,clock))
+        actors.append(torch.cat(parts,-1))
+        critics.append(torch.cat((global_state,role),-1))
+    return tuple(torch.nan_to_num(torch.stack(x,1),nan=0.,posinf=0.,neginf=0.)
+                 for x in (actors,critics))
+
+
+def arena_tactical_commands(env, skills):
+    """Bounded motor commands for five tactical choices; no joint-policy changes."""
+    length,width = arena_field(env)
+    ball = env.scene['ball'].data.root_link_pos_w[:,:2]-env.scene.terrain.env_origins[:,:2]
+    result = {}
+    for index,name in enumerate(MAPPO_BLUE):
+        d = env.scene[name].data
+        xy = d.root_link_pos_w[:,:2]-env.scene.terrain.env_origins[:,:2]
+        q = d.root_link_quat_w
+        yaw = torch.atan2(2*(q[:,0]*q[:,3]+q[:,1]*q[:,2]),1-2*(q[:,2]**2+q[:,3]**2))
+        skill = skills[:,index]
+        target = ball.clone()
+        target[:,0] -= .35
+        target[:,1] += torch.where(skill == 1,.5,-.5)
+        target[:,0] = torch.where(skill == 3,torch.full_like(skill,-.65,dtype=torch.float),target[:,0])
+        target[:,1] = torch.where(skill == 3,ball[:,1]*.4,target[:,1])
+        target[:,0].clamp_(-length+.25,length-.25)
+        target[:,1].clamp_(-width+.2,width-.2)
+        delta = target-xy
+        angle = torch.atan2(delta[:,1],delta[:,0])-yaw
+        angle = torch.atan2(angle.sin(),angle.cos())
+        distance = delta.norm(dim=-1)
+        # Turn then walk forward: avoid unvalidated sustained strafing commands.
+        vx = (.8*distance).clamp(max=.25)*angle.cos().clamp_min(0)
+        command = torch.stack((vx,torch.zeros_like(vx),(2*angle).clamp(-.75,.75)),-1)
+        command[distance < .10] = 0
+        pursue,_ = arena_team_navigation(env,name,torch.zeros(env.num_envs,dtype=torch.long,device=env.device))
+        command = torch.where((skill == 0)[:,None],pursue,command)
+        command[skill == 4] = 0
+        result[name] = command
+    return result
+
+
+def arena_mappo_team_reward(env, gamma=.997):
+    """Shared scoring + discounted potential shaping, symmetric fall/proximity costs.
+
+    Store pre-step potential in the tactical wrapper. Zero terminal potential stops
+    reset teleportation and incomplete episodes generating artificial progress.
+    Returns a rate because RewardManager multiplies all terms by motor step_dt.
+    """
+    term = env.command_manager.get_term('twist')
+    term.update_match()
+    length,_ = arena_field(env)
+    phi = ((env.scene['ball'].data.root_link_pos_w[:,0]-env.scene.terrain.env_origins[:,0])/length).clamp(-1,1)
+    previous = getattr(env,'arena_mappo_previous_potential',phi)
+    shaping = 2*(gamma*torch.where(env.reset_buf,0.,phi)-previous)
+    standing = []
+    for name in MAPPO_BLUE:
+        d = env.scene[name].data
+        standing.append((d.root_link_pos_w[:,2]-env.scene.terrain.env_origins[:,2] >= .095)
+                        & (d.projected_gravity_b[:,2] < -math.cos(math.pi/6)))
+    standing = torch.stack(standing,-1)
+    separation = (env.scene['robot'].data.root_link_pos_w[:,:2]
+                  -env.scene['blue_attacker'].data.root_link_pos_w[:,:2]).norm(dim=-1)
+    fall = (~standing).float().mean(-1)*MAPPO_FALL_COST_PER_SECOND*env.step_dt
+    crowding = (separation < .18).float()*MAPPO_CROWDING_COST_PER_SECOND*env.step_dt
+    score = 100*env.arena_goal_result
+    env.arena_mappo_diagnostics = dict(scored=(env.arena_goal_result > 0).float(),
+        conceded=(env.arena_goal_result < 0).float(),standing=standing.float().mean(-1),
+        crowding=(separation < .18).float(),fall_cost=-fall,crowding_cost=-crowding)
+    return (score+shaping-fall-crowding)/env.step_dt
+
+
+
+def arena_numerical_guard(env, asset_cfg=_DEFAULT_ASSET_CFG, sensor_names=()):
+    """Existing numerical termination plus pre-reset evidence for tactical runs."""
+    bad = robot_state_is_nan(env, asset_cfg, sensor_names)
+    output = getattr(env, 'arena_numerical_report_dir', None)
+    if output is not None and bad.any():
+        import json
+        from pathlib import Path
+        ids = bad.nonzero(as_tuple=False).flatten()
+        d = env.scene[asset_cfg.name].data
+        tensors = {name:getattr(d,name)[ids].detach().cpu() for name in (
+            'joint_pos','joint_vel','root_link_pos_w','root_link_quat_w',
+            'root_link_lin_vel_w','root_link_ang_vel_w')}
+        for name in sensor_names:
+            if name in env.scene.sensors:
+                force = getattr(env.scene.sensors[name].data,'force',None)
+                if force is not None:
+                    tensors['sensor/'+name] = force[ids].detach().cpu()
+        invalid = {name:int((~torch.isfinite(value)).sum()) for name,value in tensors.items()
+                   if not torch.isfinite(value).all()}
+        report = dict(step=int(env.common_step_counter),entity=asset_cfg.name,
+                      env_ids=ids.cpu().tolist(),nonfinite_fields=invalid,
+                      episode_steps=env.episode_length_buf[ids].cpu().tolist())
+        directory = Path(output); directory.mkdir(parents=True,exist_ok=True)
+        filename = f"step_{env.common_step_counter}_{asset_cfg.name}.pt"
+        torch.save(dict(report=report,tensors=tensors,
+                        qpos=env.sim.data.qpos[ids].detach().cpu(),
+                        qvel=env.sim.data.qvel[ids].detach().cpu()),directory/filename)
+        with (directory/'events.jsonl').open('a') as stream:
+            stream.write(json.dumps(report)+'\n')
+        print('NUMERICAL_RESET '+json.dumps(report),flush=True)
+    return bad
+
+
+# Recovery-to-walking: isolated motor practice from measured expert endings.
+def reset_recovery_walk(env, env_ids, start_probability=.75):
+    """Apply measured states after normal reset/DR; actuator caches remain reset."""
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+    bank=getattr(env,'arena_return_starts',None)
+    if bank is None:  # Initial construction before the runner loads the dataset.
+        return
+    if not hasattr(env,'arena_return_start_indices'):
+        env.arena_return_start_indices=torch.full((env.num_envs,),-1,device=env.device,dtype=torch.long)
+    env.arena_return_start_indices[env_ids]=-1
+    ids=env_ids[torch.rand(len(env_ids),device=env.device)<start_probability]
+    if len(ids)==0:
+        return
+    sample = (env.recovery_walk_bank_indices[ids] if hasattr(env, 'recovery_walk_bank_indices')
+              else torch.randint(len(bank['height']),(len(ids),),device=env.device))
+    env.arena_return_start_indices[ids]=sample
+    robot=env.scene['robot'];servo=_servo_joint_ids(env,robot)
+    pose=torch.cat((robot.data.root_link_pos_w[ids].clone(),bank['quat'][sample]),-1)
+    pose[:,2]=env.scene.terrain.env_origins[ids,2]+bank['height'][sample]
+    robot.write_root_link_pose_to_sim(pose,ids)
+    robot.write_root_link_velocity_to_sim(bank['velocity'][sample],ids)
+    robot.write_joint_state_to_sim(bank['joint_pos'][sample],bank['joint_vel'][sample],
+                                  joint_ids=servo,env_ids=ids)
+
+
+class RecoveryWalkAction(JointPositionAction):
+    def reset(self, env_ids=None):
+        super().reset(env_ids)
+        env=self._env
+        starts=getattr(env,'arena_return_start_indices',None)
+        if starts is None:
+            return
+        ids=torch.arange(env.num_envs,device=env.device) if env_ids is None else env_ids
+        if isinstance(ids,slice):
+            ids=torch.arange(env.num_envs,device=env.device)[ids]
+        ids=ids[starts[ids]>=0]
+        previous=env.arena_return_starts['last_action'][starts[ids]]
+        self._raw_actions[ids]=previous
+        env.action_manager.action[ids]=previous
+        env.action_manager.prev_action[ids]=previous
+
+
+@dataclass(kw_only=True)
+class RecoveryWalkActionCfg(JointPositionActionCfg):
+    def build(self, env):
+        return RecoveryWalkAction(self, env)
+
+
+class RecoveryWalkCommand(VelocityCommandCommandOnly):
+    """Balanced idle/forward/backward/lateral/turn commands, with stop/restart."""
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self.motion = torch.zeros_like(self.vel_command_b)
+        probs=torch.tensor(cfg.bucket_probabilities,device=self.device)
+        if len(probs)!=9 or not torch.isfinite(probs).all() or (probs<0).any() or abs(float(probs.sum())-1.)>1e-6:
+            raise ValueError('Need nine finite nonnegative bucket probabilities summing to one')
+
+    def _resample_command(self, env_ids):
+        # Explicit signed buckets make weak-command exposure reproducible.
+        choices = torch.tensor([[0,0,0],[.15,0,0],[.2,0,0],[.25,0,0],
+                                [-.1,0,0],[0,.1,0],[0,-.1,0],[0,0,.5],[0,0,-.5]], device=self.device)
+        probs=torch.tensor(self.cfg.bucket_probabilities,device=self.device)
+        self.motion[env_ids] = choices[torch.multinomial(probs,len(env_ids),replacement=True)]
+        command = getattr(self._env, "recovery_walk_eval_command", self.motion)
+        self.vel_command_b[env_ids] = command[env_ids]
+        self.vel_command_w[env_ids] = command[env_ids]
+
+    def _update_command(self):
+        command = getattr(self._env, 'recovery_walk_eval_command', self.motion)
+        self.vel_command_b.copy_(command)
+        # Evaluation retains the original 3–4 s stop window across recipes.
+        phase = self._env.episode_length_buf * self._env.step_dt
+        stop_end=4. if hasattr(self._env,'recovery_walk_eval_command') else getattr(getattr(self,'cfg',None),'stop_end_s',4.)
+        self.vel_command_b[(phase >= 3.) & (phase < stop_end)] = 0.
+        self.vel_command_w.copy_(self.vel_command_b)
+
+
+@dataclass(kw_only=True)
+class RecoveryWalkCommandCfg(VelocityCommandCommandOnlyCfg):
+    bucket_probabilities: tuple[float, ...] = (.125,.125,.125,.125,.125,.0625,.0625,.125,.125)
+    stop_end_s: float = 4.
+
+    def build(self, env):
+        return RecoveryWalkCommand(self, env)
+
+
+class RecoveryWalkTracking:
+    """Track commanded axes using a short velocity average, not gait oscillations.
+
+    This filters reward measurements only. Actor observations and actions remain
+    unchanged. Each reward term owns its history and clears it on episode reset.
+    """
+    def __init__(self, cfg, env):
+        self.velocity = torch.zeros(env.num_envs, 3, device=env.device)
+        self.initialized = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    def reset(self, env_ids=None):
+        self.initialized[slice(None) if env_ids is None else env_ids] = False
+
+    def __call__(self, env, component, std, tau_s=.15, command_name='twist', progress=False):
+        if component not in ('linear', 'angular') or std <= 0 or tau_s < 0:
+            raise ValueError('Invalid recovery tracking parameters')
+        d = env.scene['robot'].data
+        measured = d.root_link_lin_vel_b if component == 'linear' else d.root_link_ang_vel_b
+        measured = torch.nan_to_num(measured, nan=0., posinf=0., neginf=0.)
+        fresh = ~self.initialized
+        self.velocity[fresh] = measured[fresh]
+        self.initialized[:] = True
+        alpha = env.step_dt / (tau_s + env.step_dt)
+        self.velocity.lerp_(measured, alpha)
+        command = env.command_manager.get_command(command_name)
+        if progress:
+            target = command[:, :2] if component == 'linear' else command[:, 2:3]
+            actual = self.velocity[:, :2] if component == 'linear' else self.velocity[:, 2:3]
+            magnitude2 = target.square().sum(-1)
+            # Bounded rate reward: rest pays zero, wrong-way motion is negative,
+            # and exceeding the requested speed earns no additional progress.
+            value = (actual * target).sum(-1) / magnitude2.clamp_min(1e-6)
+            return torch.where(magnitude2 > 1e-6, value.clamp(-1., 1.), 0.)
+        error = self.velocity[:, :2] - command[:, :2] if component == 'linear' else self.velocity[:, 2:3] - command[:, 2:3]
+        return torch.exp(-error.square().sum(dim=-1) / std**2)

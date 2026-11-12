@@ -11,17 +11,20 @@ from collections import deque
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import mujoco
 import numpy as np
 import onnxruntime as ort
+import torch
 from bam.model import load_model
-from bam.mujoco import MujocoController
 
 import mjlab.tasks  # Initialize the task registry before importing robot configs.
 
+from mjlab_microduck.actuator.cpu_bam import CpuBamController
 from mjlab_microduck.robot.microduck_constants import HOME_FRAME, get_ball_spec, get_standup_spec
 from mjlab_microduck.tasks.microduck_football_env_cfg import get_football_goal_spec
+from mjlab_microduck.tasks.mdp import ArenaRecovery, ARENA_TEAM_PLAYERS
 
 HALF_LENGTH = 0.9
 HALF_WIDTH = 0.65
@@ -102,7 +105,8 @@ def build_world():
             rgba=[1, 1, 1, 1], contype=0, conaffinity=0,
         )
     bam = load_model(motor_name='xl330', model='m6')
-    bam.actuator.kp, bam.actuator.vin, bam.actuator.max_current = 200, 7.4, None
+    # Keep the M6 firmware current limit, matching the training actuator.
+    bam.actuator.kp, bam.actuator.vin = 200, 7.4
     limit = 7.4 * bam.kt.value / bam.R.value
     for act in spec.actuators:
         act.set_to_motor()
@@ -117,20 +121,54 @@ def build_world():
     return spec.compile(), bam
 
 
+class CpuRecovery:
+    """Adapt CPU MuJoCo/ONNX to the same recovery controller as GPU matches."""
+    def __init__(self, session, step_dt):
+        self.session=session
+        class Scene(dict):
+            terrain=SimpleNamespace(env_origins=torch.zeros(1,3))
+        self.env=SimpleNamespace(scene=Scene(),num_envs=1,device='cpu',step_dt=step_dt,
+                                arena_recovery_policy=self.infer)
+        self.controller=ArenaRecovery(self.env)
+
+    def infer(self, observation):
+        result=self.session.run(None,{self.session.get_inputs()[0].name:observation['actor'].numpy()})[0]
+        return torch.from_numpy(result)
+
+    def select(self, player, observation, action, height):
+        name=('robot','opponent')[player]
+        obs=torch.from_numpy(observation[None])
+        self.env.scene[name]=SimpleNamespace(data=SimpleNamespace(
+            root_link_pos_w=torch.tensor([[0.,0.,height]]),
+            projected_gravity_b=obs[:,3:6],root_link_ang_vel_b=obs[:,:3]))
+        return self.controller.select(name,obs,torch.from_numpy(action[None])).numpy()[0]
+
+    def labels(self):
+        players=tuple(ARENA_TEAM_PLAYERS)
+        return ['Recovery' if self.controller.active[0,players.index(name)] else 'Football'
+                for name in ('robot','opponent')]
+
+
 class Arena:
-    def __init__(self, policy: Path, seed=0):
+    def __init__(self, policy: Path, seed=0, recovery_policy: Path | None = None):
         options = ort.SessionOptions()
         options.intra_op_num_threads = 1
         self.policy = ort.InferenceSession(str(policy), options, providers=['CPUExecutionProvider'])
         if self.policy.get_inputs()[0].shape[-1] != 61 or self.policy.get_outputs()[0].shape[-1] != 14:
             raise ValueError('Arena requires the normalized 61D → 14D football ONNX policy')
         self.model, bam = build_world()
+        self.recovery=None
+        if recovery_policy is not None:
+            session=ort.InferenceSession(str(recovery_policy),options,providers=['CPUExecutionProvider'])
+            if session.get_inputs()[0].shape[-1]!=61 or session.get_outputs()[0].shape[-1]!=14:
+                raise ValueError('Recovery requires a normalized 61D → 14D ONNX policy')
+            self.recovery=CpuRecovery(session,4*self.model.opt.timestep)
         self.data = mujoco.MjData(self.model)
         self.controllers, self.roots, self.homes = [], [], []
         for i in range(2):
             names = [self.model.actuator(a).name for a in range(self.model.nu)
                      if self.model.actuator(a).name.startswith(f'p{i}_')]
-            controller = MujocoController(bam, names, self.model, self.data)
+            controller = CpuBamController(bam, names, self.model, self.data)
             self.controllers.append(controller)
             home = []
             for j in controller.joint_indexes:
@@ -148,6 +186,8 @@ class Arena:
 
     def reset(self):
         mujoco.mj_resetData(self.model, self.data)
+        if self.recovery is not None:
+            self.recovery.controller.reset()
         self.last_action = np.zeros((2,14))
         self.action_delay = deque([np.zeros((2,14)) for _ in range(4)])
         self.last_velocity = np.zeros((2,14))
@@ -196,7 +236,10 @@ class Arena:
     def step(self):
         if self.steps % 4 == 0:
             for i,controller in enumerate(self.controllers):
-                action = self.policy.run(None,{self.policy.get_inputs()[0].name:self.observation(i)[None]})[0][0]
+                observation=self.observation(i)
+                action = self.policy.run(None,{self.policy.get_inputs()[0].name:observation[None]})[0][0]
+                if self.recovery is not None:
+                    action=self.recovery.select(i,observation,action,self.data.xpos[self.roots[i],2])
                 if not np.isfinite(action).all():
                     raise RuntimeError('Non-finite policy action')
                 self.last_action[i] = action
@@ -226,17 +269,20 @@ class Arena:
             self.reset()
 
     def status(self):
-        return {'score':self.score, 'round':self.round, 'event':self.last_event, 'resets':self.resets}
+        return {'score':self.score, 'round':self.round, 'event':self.last_event, 'resets':self.resets,
+                'controllers':self.recovery.labels() if self.recovery else ['Football','Football'],
+                'recovery_enabled':self.recovery is not None}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--policy',type=Path,default=Path('logs/football_final.onnx'))
+    parser.add_argument('--recovery-policy',type=Path,help='Normalized get-up ONNX exported with scripts/export.py')
     parser.add_argument('--port',type=int,default=8081)
     parser.add_argument('--seed',type=int,default=0)
     parser.add_argument('--headless-seconds',type=float,default=0)
     args = parser.parse_args()
-    arena = Arena(args.policy,args.seed)
+    arena = Arena(args.policy,args.seed,args.recovery_policy)
     if args.headless_seconds:
         for _ in range(round(args.headless_seconds/.005)):
             arena.step()
@@ -257,6 +303,8 @@ def main():
             score_label.text = score_text
         scoreboard.content = (f'## {score_text}\n'
             f'Policy: **{args.policy.stem}**\n\n'
+            f'Recovery: **{"enabled" if arena.recovery else "disabled"}** · '
+            f'Controllers: **{" / ".join(arena.status()["controllers"])}**\n\n'
             f'Blue attacks +X · Orange attacks −X\n\nRound {arena.round} · '
             f'{arena.steps * arena.model.opt.timestep:.1f} / 10 s · {arena.last_event}\n\n'
             'Same trained kicking policy on both teams. Rounds end only on a goal or the 10-second timeout.')

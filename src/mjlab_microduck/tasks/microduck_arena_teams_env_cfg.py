@@ -16,6 +16,9 @@ from .microduck_arena_env_cfg import (
 
 ENABLE_SYMMETRY = False
 ENABLE_BOARDS = True
+PITCH_HALF_LENGTH = 1.5
+PITCH_HALF_WIDTH = 1.0
+ROUND_SECONDS = 20.0
 REWARD_RECIPE = 'three-a-side-v1'
 
 
@@ -27,10 +30,14 @@ def make_microduck_arena_teams_env_cfg(play: bool = False, rough: bool = False):
         if name not in ('robot','opponent'):
             cfg.terminations[f'{name}_nan'] = TerminationTermCfg(
                 func=mdp.robot_state_is_nan,params={'asset_cfg':SceneEntityCfg(name)})
+    cfg.sim.nconmax = 750
+    cfg.commands['twist'] = mdp.ArenaTeamCommandCfg(
+        resampling_time_range=(21.,21.),aim='open',
+        pitch_half_length=PITCH_HALF_LENGTH,pitch_half_width=PITCH_HALF_WIDTH)
+    cfg.episode_length_s = ROUND_SECONDS
+    cfg.scene.env_spacing = 5.0
     if ENABLE_BOARDS:
         add_arena_boards(cfg)
-    cfg.sim.nconmax = 750
-    cfg.commands['twist'] = mdp.ArenaTeamCommandCfg(resampling_time_range=(11.,11.),aim='open')
     cfg.actions['joint_pos'] = mdp.ArenaTeamJointPositionActionCfg(
         entity_name='robot',actuator_names=('^(?!passive_).*',),scale=1.)
     cfg.events['reset_arena'] = EventTermCfg(func=mdp.reset_arena_teams,mode='reset')

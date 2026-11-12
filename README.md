@@ -1,12 +1,12 @@
-# Microduck Go
+# Microduck League
 
 **An arena for trained Microducks to face off.**
 
-[Microduck Go](https://github.com/automaticdai/microduck_go) brings learned robot
+[Microduck League](https://github.com/automaticdai/microduck-league) brings learned robot
 skills into a shared arena: train a duck, enter it in a match, and watch it
-compete against another duck. Football is the first matchup — **two ducks, two
-goals, one ball** — with robot fights and other competitive challenges as the
-broader direction.
+compete in individual and team matches. Football is the first game, with
+**1v1 and 3v3 arenas**, two goals, and one shared ball. Cooperative multi-agent
+learning and competitive tactics are the next direction.
 
 The contenders are [Microducks](https://github.com/pollen-robotics/microduck),
 ~800 g, ~25 cm tall bipedal robots with 14 servos. The project builds on the
@@ -20,8 +20,9 @@ running learned skills on real robots.
 | Capability | Status |
 |---|---|
 | Single-duck football | Implemented: approach a tracked ball, shoot into a goal, and stay standing. A trained checkpoint has been visually reviewed locally. |
-| Two-duck football arena | In development: a shared pitch, opposing goals, one physical ball, and independent policy control. Match behavior is still being validated. |
-| Competitive tactics and self-play | Planned: the current football policy learns individual shots, not defense, tackling, or opponent-aware strategy. |
+| Two-duck football arena | Implemented: shared physics, attacker and keeper policies, opponent snapshots for self-play, and match evaluation. Behavior remains under validation. |
+| Three-a-side football | Implemented: two attackers and one defender per team, boards, team visuals, and GPU playback. Training updates one blue attacker; the other five players use frozen policies. |
+| Cooperative multi-agent learning | Stage 1 implemented: shared tactical MAPPO trains both blue attackers above frozen motor policies on a 3.0 × 2.0 m pitch. Optional frozen stand-up recovery handles falls for all six players. Learned coordination is not yet validated. See the [arena guide](docs/arena.md#tactical-mappo-stage-1). |
 | Robot fights and additional game modes | Project direction; not implemented yet. |
 
 Trained weights are not bundled with the repository. The instructions below
@@ -34,8 +35,8 @@ Install [uv](https://docs.astral.sh/uv/) and use Python 3.12. Training and the
 mjlab policy viewer require a CUDA GPU; exported policies can run in CPU MuJoCo.
 
 ```bash
-git clone https://github.com/automaticdai/microduck_go.git
-cd microduck_go
+git clone https://github.com/automaticdai/microduck-league.git
+cd microduck-league
 uv sync --locked
 
 # Discover the available training environments.
@@ -60,10 +61,10 @@ the first sync to allow time for the CUDA wheels to download.
    skill such as approaching a ball and shooting.
 2. **Evaluate the policy.** Check standing, task success, and visual behavior;
    a higher training reward alone does not establish match readiness.
-3. **Enter the arena.** The arena under development puts independently controlled
-   ducks in the same physics simulation, with shared objects and match rules.
-4. **Improve through competition.** Opponent-aware training and self-play are
-   future work built on those match outcomes.
+3. **Enter the arena.** Independently controlled ducks share a physics simulation,
+   ball, and match rules in 1v1 or 3v3 football.
+4. **Improve through competition.** Fine-tune against fixed opponents and policy
+   snapshots. Joint teammate learning and tactical coordination are future work.
 
 The Python package remains `mjlab_microduck`, and existing `Mjlab-…-MicroDuck`
 task IDs and command names remain valid after the project rename.
@@ -328,7 +329,7 @@ joint-index mappings, reward sign conventions, and NaN guards.
 
 ## Related projects
 
-- [microduck_rl](https://github.com/pollen-robotics/microduck_rl) — the upstream training foundation for Microduck Go
+- [microduck_rl](https://github.com/pollen-robotics/microduck_rl) — the upstream training foundation for Microduck League
 
 - [microduck](https://github.com/pollen-robotics/microduck) — the Microduck project home, including the onboard runtime that runs the exported policies
 - [mjlab](https://github.com/mujocolab/mjlab) — the training framework (MuJoCo Warp + rsl_rl)

@@ -5,6 +5,7 @@ The actor remains 61D; the critic additionally observes the opponent. No fall or
 out-of-bounds termination: only goals, timeout, and numerical-safety failures.
 """
 from copy import deepcopy
+from functools import partial
 import mujoco
 from mjlab.entity import EntityCfg
 from mjlab.managers import EventTermCfg, ObservationTermCfg, RewardTermCfg, TerminationTermCfg
@@ -29,14 +30,23 @@ SUPPORT_REWARD_WEIGHTS = {
 # Low boards around the pitch: side lines plus end lines beside each goal (goal + net close the
 # mouth). (x, y, half-x, half-y) of each box; the ball stays in play instead of rolling away.
 BOARD_HEIGHT = .08
-ARENA_BOARDS = ((0,.665,.945,.005),(0,-.665,.945,.005),
-                (.94,.44,.005,.23),(.94,-.44,.005,.23),(-.94,.44,.005,.23),(-.94,-.44,.005,.23))
+def arena_boards(half_length=.9, half_width=.65):
+    end = half_length + .04
+    outer_y = half_width + .015
+    segment = (outer_y - .21) / 2
+    center = .21 + segment
+    return ((0,outer_y,end+.005,.005),(0,-outer_y,end+.005,.005),
+            (end,center,.005,segment),(end,-center,.005,segment),
+            (-end,center,.005,segment),(-end,-center,.005,segment))
 
 
-def get_arena_boards_spec():
+ARENA_BOARDS = arena_boards()
+
+
+def get_arena_boards_spec(half_length=.9, half_width=.65):
     spec = mujoco.MjSpec()
     body = spec.worldbody.add_body(name='boards',mocap=True)  # Moved to each arena origin by reset_arena.
-    for i,(x,y,sx,sy) in enumerate(ARENA_BOARDS):
+    for i,(x,y,sx,sy) in enumerate(arena_boards(half_length,half_width)):
         body.add_geom(name=f'board_{i}',type=mujoco.mjtGeom.mjGEOM_BOX,pos=[x,y,BOARD_HEIGHT/2],
                       size=[sx,sy,BOARD_HEIGHT/2],rgba=[.95,.95,.95,.9],contype=1,conaffinity=1)
     return spec
@@ -44,7 +54,9 @@ def get_arena_boards_spec():
 
 def add_arena_boards(cfg):
     """Opt-in: collide the ball and ducks with pitch boards (changes the task; off by default)."""
-    cfg.scene.entities['boards'] = EntityCfg(spec_fn=get_arena_boards_spec)
+    term = cfg.commands['twist']
+    cfg.scene.entities['boards'] = EntityCfg(spec_fn=partial(
+        get_arena_boards_spec,term.pitch_half_length,term.pitch_half_width))
     return cfg
 
 

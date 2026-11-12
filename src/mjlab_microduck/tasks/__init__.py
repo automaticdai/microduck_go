@@ -303,6 +303,26 @@ from .microduck_arena_env_cfg import (make_microduck_arena_env_cfg, MicroduckAre
                                       make_microduck_arena_v3_env_cfg, MicroduckArenaV3RlCfg,
                                       make_microduck_arena_keeper_env_cfg, MicroduckArenaKeeperRlCfg)
 from .microduck_arena_teams_env_cfg import make_microduck_arena_teams_env_cfg, MicroduckArenaTeamsRlCfg
+from .microduck_finishing_env_cfg import (
+    make_microduck_finishing_env_cfg, MicroduckFinishingRlCfg,
+    make_microduck_return_to_play_env_cfg, MicroduckReturnToPlayRlCfg,
+)
+
+register_mjlab_task(
+    task_id='Mjlab-FootballReturnToPlay-Flat-MicroDuck',
+    env_cfg=make_microduck_return_to_play_env_cfg(),
+    play_env_cfg=make_microduck_return_to_play_env_cfg(play=True),
+    rl_cfg=MicroduckReturnToPlayRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id='Mjlab-FootballFinishing-Flat-MicroDuck',
+    env_cfg=make_microduck_finishing_env_cfg(),
+    play_env_cfg=make_microduck_finishing_env_cfg(play=True),
+    rl_cfg=MicroduckFinishingRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
 
 register_mjlab_task(
     task_id='Mjlab-FootballArena-3v3-Flat-MicroDuck',
@@ -330,5 +350,16 @@ register_mjlab_task(
     env_cfg=make_microduck_arena_keeper_env_cfg(),
     play_env_cfg=make_microduck_arena_keeper_env_cfg(play=True),
     rl_cfg=MicroduckArenaKeeperRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+from .microduck_recovery_walk_env_cfg import (
+    TASK as RECOVERY_WALK_TASK, make_microduck_recovery_walk_env_cfg, MicroduckRecoveryWalkRlCfg,
+)
+register_mjlab_task(
+    task_id=RECOVERY_WALK_TASK,
+    env_cfg=make_microduck_recovery_walk_env_cfg(),
+    play_env_cfg=make_microduck_recovery_walk_env_cfg(play=True),
+    rl_cfg=MicroduckRecoveryWalkRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )

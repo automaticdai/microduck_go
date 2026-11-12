@@ -26,9 +26,12 @@ TASK = 'Mjlab-FootballArena-Flat-MicroDuck'
 TEAMS_TASK = 'Mjlab-FootballArena-3v3-Flat-MicroDuck'
 
 
-from mjlab_microduck.tasks.microduck_arena_env_cfg import ARENA_BOARDS, BOARD_HEIGHT
+from mjlab_microduck.tasks.microduck_arena_env_cfg import arena_boards, BOARD_HEIGHT
 from mjlab_microduck.tasks.microduck_football_env_cfg import get_football_goal_spec
-from mjlab_microduck.tasks.mdp import ARENA_TEAM_PLAYERS
+from mjlab_microduck.tasks.mdp import (
+    ARENA_TEAM_PLAYERS, ArenaRecovery, ArenaFinishingJointPositionActionCfg,
+    arena_recovery_action,
+)
 
 TEAM_COLORS = {'robot': (25,115,255), 'opponent': (255,77,13)}
 
@@ -40,15 +43,15 @@ def team_goal_spec(team):
     return spec
 
 
-def pitch_spec(boards=False):
+def pitch_spec(boards=False, half_length=.9, half_width=.65):
     spec = mujoco.MjSpec()
     body = spec.worldbody.add_body(name='pitch')
     def box(name,pos,size,color):
         body.add_geom(name=name,type=mujoco.mjtGeom.mjGEOM_BOX,pos=pos,size=size,
                       rgba=color,contype=0,conaffinity=0)
-    box('green_tile',[0,0,0],[.9,.65,.0005],[.08,.38,.16,1])
-    for i,(x,y,sx,sy) in enumerate(((0,.65,.9,.005),(0,-.65,.9,.005),
-                                   (.9,0,.005,.65),(-.9,0,.005,.65),(0,0,.004,.65))):
+    box('green_tile',[0,0,0],[half_length,half_width,.0005],[.08,.38,.16,1])
+    for i,(x,y,sx,sy) in enumerate(((0,half_width,half_length,.005),(0,-half_width,half_length,.005),
+                                   (half_length,0,.005,half_width),(-half_length,0,.005,half_width),(0,0,.004,half_width))):
         box(f'line_{i}',[x,y,.001],[sx,sy,.001],[1,1,1,1])
     angles = np.linspace(0,2*np.pi,65)
     for a,b in zip(angles[:-1],angles[1:]):
@@ -58,7 +61,7 @@ def pitch_spec(boards=False):
     if boards:
         # Low boards: side lines, plus end lines beside each goal (the goal and net close the mouth).
         h = BOARD_HEIGHT/2
-        for i,(x,y,sx,sy) in enumerate(ARENA_BOARDS):
+        for i,(x,y,sx,sy) in enumerate(arena_boards(half_length,half_width)):
             body.add_geom(name=f'board_{i}',type=mujoco.mjtGeom.mjGEOM_BOX,pos=[x,y,h],size=[sx,sy,h],
                           rgba=[.95,.95,.95,.9],contype=1,conaffinity=1)
     return spec
@@ -82,7 +85,8 @@ def playback_cfg(boards=True,goal_hold_s=2.,teams=False):
     cfg.scene.num_envs=1
     # The viewer's pitch provides boards; avoid duplicating the training entity.
     cfg.scene.entities.pop('boards',None)
-    cfg.scene.entities['pitch']=EntityCfg(spec_fn=lambda: pitch_spec(boards=boards))
+    cfg.scene.entities['pitch']=EntityCfg(spec_fn=partial(pitch_spec,boards=boards,half_length=cfg.commands['twist'].pitch_half_length,
+        half_width=cfg.commands['twist'].pitch_half_width))
     cfg.commands['twist'].goal_hold_s=goal_hold_s
     cfg.scene.entities['robot'].spec_fn=blue_spec
     cfg.scene.entities['opponent'].spec_fn=orange_spec
@@ -103,7 +107,7 @@ def playback_cfg(boards=True,goal_hold_s=2.,teams=False):
     cfg.sim.nan_guard.enabled=False
     cfg.viewer.origin_type=ViewerConfig.OriginType.WORLD
     cfg.viewer.lookat=(0,0,.1)
-    cfg.viewer.distance=2.6
+    cfg.viewer.distance=4.0 if teams else 2.6
     cfg.viewer.azimuth=125
     cfg.viewer.elevation=-35
     cfg.viewer.enable_reflections=False
@@ -128,12 +132,21 @@ class MatchEnv(RslRlVecEnvWrapper):
     @torch.inference_mode()
     def reset(self):
         result=super().reset()
+        recovery=getattr(self.unwrapped,'arena_recovery',None)
+        if recovery is not None:
+            recovery.reset()
         self.cached_obs=result[0]
         self.elapsed=0.
         return result
 
     def step(self,actions):
+        if getattr(self.unwrapped,'arena_recovery',None) is not None:
+            actions=arena_recovery_action(self.unwrapped,'robot',
+                self.get_observations()['actor'],actions)
         result=super().step(actions)
+        recovery=getattr(self.unwrapped,'arena_recovery',None)
+        if recovery is not None:
+            recovery.reset(result[2].nonzero().flatten())
         self.cached_obs=result[0]
         self.elapsed+=self.unwrapped.step_dt
         # One small GPU-to-CPU transfer for the referee, outside physics substeps.
@@ -144,7 +157,7 @@ class MatchEnv(RslRlVecEnvWrapper):
             self.last_event=f'{("Blue","Orange")[player]} scores!'
             self.goal_this_round=True
         elif event[1] and not self.goal_this_round:
-            self.last_event='Timeout' if self.elapsed>=9.99 else 'Numerical reset'
+            self.last_event='Timeout' if self.elapsed>=self.unwrapped.cfg.episode_length_s-.01 else 'Numerical reset'
         if event[1]:
             print(json.dumps({'score':self.score,'round':self.round,'event':self.last_event}),flush=True)
             self.round+=1
@@ -184,7 +197,7 @@ class ArenaViewer(ViserPlayViewer):
         }
         self.role_labels={name:self._server.scene.add_label(
             f'/team_roles/{name}',role.title(),font_screen_scale=.7)
-            for name,(_,role) in players.items() if len(players) == 6}
+            for name,(_,role) in players.items()}
 
     @torch.inference_mode()
     def _handle_gui_reset(self, all_envs):
@@ -218,6 +231,12 @@ class ArenaViewer(ViserPlayViewer):
             return
         self.last_panel_update=now
         match=self.env
+        recovery=getattr(match.unwrapped,'arena_recovery',None)
+        active=(recovery.active[0].cpu().tolist() if recovery is not None
+                else [False]*len(ARENA_TEAM_PLAYERS))
+        for i,(name,(_,role)) in enumerate(ARENA_TEAM_PLAYERS.items()):
+            if name in self.role_labels:
+                self.role_labels[name].text='Recovery' if active[i] else role.title()
         score=f'Blue {match.score[0]}:{match.score[1]} Orange'
         if self.score_label.text!=score:
             self.score_label.text=score
@@ -228,7 +247,8 @@ class ArenaViewer(ViserPlayViewer):
         self.panel.content=(f'## {score}\n\nBlue: **{self.checkpoint.stem}** · Orange: **{self.opponent_label}**\n\n'
             f'**{torch.cuda.get_device_name(0)} · CUDA physics + inference**\n\n'
             f'Playback: **{status.actual_realtime:.2f}× real time**\n\n'
-            f'Round {match.round} · {match.elapsed:.1f} / 10 s · {match.last_event}')
+            f'Recovery: **{"enabled" if recovery is not None else "disabled"}**\n\n'
+            f'Round {match.round} · {match.elapsed:.1f} / {match.unwrapped.cfg.episode_length_s:g} s · {match.last_event}')
 
 
 def main():
@@ -236,6 +256,8 @@ def main():
     parser.add_argument('--checkpoint',type=Path,required=True)
     parser.add_argument('--teams',action='store_true',help='3v3: two attackers and one defender per team')
     parser.add_argument('--defender-policy',type=Path,help='Keeper checkpoint for both 3v3 defenders')
+    parser.add_argument('--recovery-policy',type=Path,
+                        help='Get-up checkpoint, including its own observation normalizer')
     parser.add_argument('--port',type=int,default=8081)
     parser.add_argument('--benchmark-steps',type=int,default=0)
     parser.add_argument('--compile-friction',action='store_true')
@@ -255,6 +277,9 @@ def main():
     torch.set_num_threads(1)
     configure_torch_backends()
     cfg=playback_cfg(boards=not args.no_boards,goal_hold_s=args.goal_hold,teams=args.teams)
+    if args.recovery_policy and not args.teams:
+        cfg.actions['joint_pos']=ArenaFinishingJointPositionActionCfg(
+            **vars(cfg.actions['joint_pos']))
     probs={'solo':(1.,0.,0.),'keeper':(0.,1.,0.),'attacker':(0.,0.,1.)}[args.opponent_role]
     if not args.teams:
         cfg.events['reset_arena'].params['mode_stages']=[{'step':0,'probs':probs}]
@@ -275,6 +300,13 @@ def main():
         runner=load_runner_cls(task)(wrapped,asdict(agent),device='cuda:0')
         runner.load(str(args.checkpoint),load_cfg={'actor':True},map_location='cuda:0')
         policy=runner.get_inference_policy(device='cuda:0')
+        if args.recovery_policy:
+            recovery=deepcopy(runner.alg.actor).eval().requires_grad_(False)
+            recovery.load_state_dict(torch.load(args.recovery_policy,map_location='cuda:0',
+                                                weights_only=False)['actor_state_dict'])
+            env.arena_recovery_policy=recovery
+            env.arena_recovery=ArenaRecovery(env)
+        print(f'Recovery policy: {args.recovery_policy or "DISABLED"}',flush=True)
         env.arena_opponent_policy=policy
         if args.opponent_policy:
             opponent=deepcopy(runner.alg.actor).eval().requires_grad_(False)

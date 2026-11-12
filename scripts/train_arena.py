@@ -9,6 +9,8 @@ from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime
 import json
+import hashlib
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -24,11 +26,22 @@ from mjlab_microduck.tasks import mdp
 
 from mjlab_microduck.tasks import microduck_arena_env_cfg as arena_cfg
 from mjlab_microduck.tasks import microduck_arena_teams_env_cfg as teams_cfg
+from mjlab_microduck.tasks import microduck_finishing_env_cfg as finishing_cfg
 
 RECIPES = {'Mjlab-FootballArena-Flat-MicroDuck': arena_cfg.REWARD_RECIPE,
            'Mjlab-FootballArena-V3-Flat-MicroDuck': arena_cfg.V3_RECIPE,
            'Mjlab-FootballArena-Keeper-Flat-MicroDuck': arena_cfg.KEEPER_RECIPE,
-           'Mjlab-FootballArena-3v3-Flat-MicroDuck': teams_cfg.REWARD_RECIPE}
+           'Mjlab-FootballArena-3v3-Flat-MicroDuck': teams_cfg.REWARD_RECIPE,
+           'Mjlab-FootballFinishing-Flat-MicroDuck': finishing_cfg.REWARD_RECIPE,
+           'Mjlab-FootballReturnToPlay-Flat-MicroDuck': finishing_cfg.RETURN_TO_PLAY_RECIPE}
+
+
+def mixed_opponent_action(obs, mode, baseline, snapshot, keeper, use_snapshot):
+    """A keeper checkpoint remains a keeper during fixed-opponent evaluation."""
+    action = torch.where(use_snapshot, snapshot(obs), baseline(obs))
+    if keeper is not None:
+        action = torch.where(mode == mdp.KEEPER, keeper(obs), action)
+    return action
 
 
 def main():
@@ -43,6 +56,9 @@ def main():
     parser.add_argument('--mode-probs',type=float,nargs=3,metavar=('SOLO','KEEPER','ATTACKER'),
                         help='Replace the opponent-mode schedule with one fixed mix')
     parser.add_argument('--keeper-policy',type=Path,help='Frozen policy for keeper-mode opponents (default: --opponent-policy)')
+    parser.add_argument('--recovery-policy',type=Path,
+                        help='Finishing/ReturnToPlay: frozen opponent recovery; PPO learner is never overridden')
+    parser.add_argument('--recovery-starts',type=Path,help='Measured stable handoff states for ReturnToPlay')
     parser.add_argument('--keeper-max-speed',type=float,nargs=4,metavar=('BACK','FWD','SIDE','YAW'),
                         help='Keeper command limits (a learned keeper wants its training limits)')
     parser.add_argument('--boards',action='store_true',help='Pitch boards keep the ball in play (arena_cfg.add_arena_boards)')
@@ -55,6 +71,18 @@ def main():
     parser.add_argument('--evaluate-seconds',type=float,default=0)
     args = parser.parse_args()
     teams = args.task == 'Mjlab-FootballArena-3v3-Flat-MicroDuck'
+    return_to_play = args.task == 'Mjlab-FootballReturnToPlay-Flat-MicroDuck'
+    finishing = args.task == 'Mjlab-FootballFinishing-Flat-MicroDuck' or return_to_play
+    if return_to_play != bool(args.recovery_starts):
+        parser.error('ReturnToPlay requires --recovery-starts; other tasks do not accept it')
+    if finishing and not args.keeper_policy:
+        parser.error('Finishing requires the measured --keeper-policy')
+    if args.recovery_policy and not finishing:
+        parser.error('--recovery-policy is supported only by Finishing and ReturnToPlay')
+    if finishing:
+        args.no_self_play = True
+        if args.mode_probs and args.mode_probs[2] != 0:
+            parser.error('Finishing supports only solo/keeper mode probabilities')
     if teams and args.mode_probs:
         parser.error('3v3 has fixed roles; --mode-probs applies only to two-player arenas')
     if teams and not args.keeper_policy:
@@ -68,8 +96,8 @@ def main():
     if args.keeper_max_speed:
         cfg.actions['joint_pos'].keeper_max_speed = tuple(args.keeper_max_speed)
     if args.mode_probs:
-        if abs(sum(args.mode_probs)-1) > 1e-6:
-            parser.error('--mode-probs must sum to 1')
+        if min(args.mode_probs) < 0 or abs(sum(args.mode_probs)-1) > 1e-6:
+            parser.error('--mode-probs must be nonnegative and sum to 1')
         cfg.events['reset_arena'].params['mode_stages'] = [{'step':0,'probs':tuple(args.mode_probs)}]
     cfg.seed = agent.seed
     cfg.sim.nan_guard.enabled = args.iterations <= 5
@@ -81,10 +109,24 @@ def main():
     dump_yaml(out/'params/env.yaml',asdict(cfg))
     dump_yaml(out/'params/agent.yaml',asdict(agent))
     (out/'initialization.json').write_text(json.dumps({**vars(args),
+        'recovery_starts_sha256':hashlib.sha256(args.recovery_starts.read_bytes()).hexdigest() if args.recovery_starts else None,
         'recipe':RECIPES[args.task],'actor_only_initialization':not bool(args.resume)},default=str,indent=2))
     configure_torch_backends()
     env = ManagerBasedRlEnv(cfg,device='cuda:0')
     try:
+        if args.recovery_starts:
+            bank=torch.load(args.recovery_starts,map_location='cuda:0',weights_only=True)
+            n=len(bank['height'])
+            expected={'height':(n,),'quat':(n,4),'velocity':(n,6),
+                      'joint_pos':(n,14),'joint_vel':(n,14),'last_action':(n,14)}
+            if n<16 or set(bank)!=set(expected) or any(
+                    tuple(bank[k].shape)!=shape or not torch.isfinite(bank[k]).all()
+                    for k,shape in expected.items()):
+                raise ValueError('Invalid recovery-start bank: need >=16 finite 14-servo states')
+            if not torch.allclose(bank['quat'].norm(dim=-1),torch.ones(n,device='cuda:0'),atol=1e-4):
+                raise ValueError('Recovery-start orientations must be normalized')
+            env.arena_return_starts=bank
+            shutil.copyfile(args.recovery_starts,out/'recovery_starts.pt')
         wrapped = RslRlVecEnvWrapper(env,clip_actions=agent.clip_actions)
         runner = load_runner_cls(args.task)(wrapped,asdict(agent),str(out),device='cuda:0')
         runner.load(str(args.from_policy),load_cfg={'actor':True},map_location='cuda:0')
@@ -95,6 +137,11 @@ def main():
         if args.keeper_policy:
             keeper_policy = deepcopy(baseline)
             keeper_policy.load_state_dict(torch.load(args.keeper_policy,map_location='cuda:0',weights_only=False)['actor_state_dict'])
+        if args.recovery_policy:
+            recovery_policy = deepcopy(baseline)
+            recovery_policy.load_state_dict(torch.load(args.recovery_policy,map_location='cuda:0',weights_only=False)['actor_state_dict'])
+            env.arena_recovery_policy = recovery_policy.eval().requires_grad_(False)
+            env.arena_recovery = mdp.ArenaRecovery(env)
         if args.opponent_policy:
             baseline.load_state_dict(torch.load(args.opponent_policy,map_location='cuda:0',weights_only=False)['actor_state_dict'])
         if args.resume:
@@ -109,16 +156,12 @@ def main():
             runner.current_learning_iteration = 0
         mask = (torch.arange(env.num_envs,device='cuda:0') % 2 == 0)[:,None]
         def opponent_policy(obs):
-            if args.evaluate_seconds:
-                return baseline(obs)
             # Keeper and solo arenas always walk with the fixed reference policy (keeper was
             # validated with it); attackers alternate between reference and self-play snapshot.
             mode = mdp.arena_opponent_mode(env)[:,None]
-            use_self = ~mask & (mode == mdp.ATTACKER) & (not args.no_self_play)
-            action = torch.where(use_self,opponent(obs),baseline(obs))
-            if args.keeper_policy:
-                action = torch.where(mode == mdp.KEEPER,keeper_policy(obs),action)
-            return action
+            use_self = ~mask & (mode == mdp.ATTACKER) & (not args.no_self_play) & (not args.evaluate_seconds)
+            return mixed_opponent_action(obs,mode,baseline,opponent,
+                keeper_policy if args.keeper_policy else None,use_self)
         env.arena_opponent_policy = opponent_policy
         if teams:
             env.arena_teammate_policy = teammate
@@ -142,6 +185,12 @@ def main():
                     '--num-envs','64','--evaluate-seconds','20','--run-name',f'{args.run_name}-eval-{iteration}']
                 if args.keeper_policy:
                     command += ['--keeper-policy',str(args.keeper_policy)]
+                if args.recovery_policy:
+                    command += ['--recovery-policy',str(args.recovery_policy)]
+                if args.recovery_starts:
+                    command += ['--recovery-starts',str(args.recovery_starts)]
+                if args.mode_probs:
+                    command += ['--mode-probs',*map(str,args.mode_probs)]
                 if args.keeper_max_speed:
                     command += ['--keeper-max-speed',*map(str,args.keeper_max_speed)]
                 if args.boards:
